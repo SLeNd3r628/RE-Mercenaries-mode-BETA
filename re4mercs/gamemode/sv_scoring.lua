@@ -1,0 +1,147 @@
+-- RE4 Mercenaries Remake - Scoring System (Server)
+-- Updated to track last kill score and time for floating text
+
+--- Called when a player kills an NPC/NextBot
+function RE4M_OnKill(ply, victim, dmgInfo)
+    if not IsValid(ply) or not ply:IsPlayer() then return end
+    if RE4M_STATE.GameState ~= GAMESTATE_ACTIVE then return end
+
+    -- Guard against double-crediting the same kill. OnNPCKilled (and the
+    -- NextBot OnKilled override) can sometimes fire more than once for the
+    -- same entity - e.g. from splash/simultaneous damage - which was
+    -- causing combo/score/kills to increment by 2 instead of 1.
+    if IsValid(victim) then
+        if victim.RE4M_KillCredited then return end
+        victim.RE4M_KillCredited = true
+    end
+
+    local cfg = RE4MERCS_GetConfig()
+
+    -- Increment kills
+    local kills = ply:RE4M_GetKills() + 1
+    ply:SetNWInt("RE4M_Kills", kills)
+
+    -- Increment combo
+    local combo = ply:RE4M_GetCombo() + 1
+    ply:SetNWInt("RE4M_Combo", combo)
+
+    -- Track max combo
+    if combo > ply:RE4M_GetMaxCombo() then
+        ply:SetNWInt("RE4M_MaxCombo", combo)
+    end
+
+    -- Reset combo timer
+    ply.RE4M_LastKillTime = CurTime()
+
+    -- Calculate score
+    local baseScore = cfg.BaseKillScore or 500
+    local multiplier = RE4MERCS_GetComboMultiplier(combo)
+    local bonus = 0
+
+    -- Headshot bonus
+    local hitGroup = ply.RE4M_LastHitGroup or HITGROUP_GENERIC
+    if hitGroup == HITGROUP_HEAD then
+        bonus = bonus + (cfg.HeadshotBonus or 250)
+    end
+
+    -- Elite kill bonus
+    if IsValid(victim) and victim.RE4M_IsElite then
+        bonus = bonus + (cfg.EliteKillBonus or 750)
+    end
+
+    -- Melee kill bonus
+    if dmgInfo and (dmgInfo:IsDamageType(DMG_CLUB) or dmgInfo:IsDamageType(DMG_SLASH)) then
+        bonus = bonus + (cfg.MeleeKillBonus or 300)
+    end
+
+    local totalScore = math.floor((baseScore + bonus) * multiplier)
+    local currentScore = ply:RE4M_GetScore()
+    ply:SetNWInt("RE4M_Score", currentScore + totalScore)
+
+    -- Time extension on kill
+    local timeExtend = cfg.TimeExtendOnKill or 2
+    RE4M_ExtendTime(timeExtend, ply)
+
+    -- Store for floating text system
+    ply.RE4M_LastKillScore = totalScore
+    ply.RE4M_LastTimeAdded = timeExtend
+
+    -- Combo milestone bonuses
+    local comboTimeExtends = {
+        [10]  = cfg.TimeExtendOnCombo10 or 5,
+        [25]  = cfg.TimeExtendOnCombo25 or 10,
+        [50]  = cfg.TimeExtendOnCombo50 or 15,
+        [100] = cfg.TimeExtendOnCombo100 or 30,
+    }
+
+    if comboTimeExtends[combo] then
+        local bonusTime = comboTimeExtends[combo]
+        RE4M_ExtendTime(bonusTime, ply)
+        ply.RE4M_LastTimeAdded = timeExtend + bonusTime
+
+        -- Send combo milestone popup
+        net.Start("RE4M_ComboPopup")
+            net.WriteUInt(combo, 16)
+            net.WriteFloat(bonusTime)
+        net.Send(ply)
+
+        -- Play sound with increasing pitch
+        ply:EmitSound("re4mercs/combo_milestone.ogg", 60, 100 + math.min(combo, 50), 0.7)
+        if not file.Exists("sound/re4mercs/combo_milestone.ogg", "GAME") then
+            ply:EmitSound("buttons/button15.wav", 60, 100 + math.min(combo, 50), 0.7)
+        end
+    end
+
+    -- Send kill feed notification
+    net.Start("RE4M_KillFeed")
+        net.WriteUInt(totalScore, 24)
+        net.WriteUInt(combo, 16)
+        net.WriteFloat(multiplier)
+        net.WriteBool(bonus > 0)
+    net.Send(ply)
+
+    -- Send score update
+    net.Start("RE4M_ScoreUpdate")
+        net.WriteUInt(ply:RE4M_GetScore(), 32)
+        net.WriteUInt(combo, 16)
+        net.WriteFloat(multiplier)
+    net.Send(ply)
+
+    -- Try to spawn a pickup
+    RE4M_TrySpawnPickup(victim)
+end
+
+--- Reset a player's combo
+function RE4M_ResetCombo(ply, reason)
+    if not IsValid(ply) then return end
+
+    local oldCombo = ply:RE4M_GetCombo()
+    if oldCombo <= 0 then return end
+
+    ply:SetNWInt("RE4M_Combo", 0)
+    ply.RE4M_LastKillTime = 0
+
+    net.Start("RE4M_ScoreUpdate")
+        net.WriteUInt(ply:RE4M_GetScore(), 32)
+        net.WriteUInt(0, 16)
+        net.WriteFloat(1.0)
+    net.Send(ply)
+
+    if RE4MERCS_CONFIG and RE4MERCS_CONFIG.Debug then
+        print("[RE4 Mercs] " .. ply:Nick() .. " combo reset (" .. reason .. "): was " .. oldCombo)
+    end
+end
+
+--- Reset combo when player takes damage
+hook.Add("EntityTakeDamage", "RE4M_PlayerDamageComboReset", function(target, dmgInfo)
+    if RE4M_STATE.GameState ~= GAMESTATE_ACTIVE then return end
+
+    local cfg = RE4MERCS_GetConfig()
+    if not cfg.ComboResetOnDamage then return end
+
+    if IsValid(target) and target:IsPlayer() then
+        local attacker = dmgInfo:GetAttacker()
+        if attacker == target then return end
+        RE4M_ResetCombo(target, "damage taken")
+    end
+end)

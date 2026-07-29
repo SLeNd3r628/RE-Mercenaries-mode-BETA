@@ -1,0 +1,8 @@
+"re4mercs"
+{
+	"base"		"base"
+	"title"		"The Mercenaries"
+	"maps"		"^merc_"
+	"category"	"other"
+	"menusystem"	"1"
+}
