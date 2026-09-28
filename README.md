@@ -11,10 +11,13 @@
 - **Customization**: Full loadout picker, playermodel + hands/skin/bodygroup selector, player color.
 - **Themes**: Resident Evil 4 enemies (default), Half-Life 2 enemies, and future custom NPC support.
 - **Extra**: Animated results screen, floating damage numbers, kill feed, elite alerts, combo popups, health bars, and dedicated music system.
+- *Third person*: Features a native third person camera and movement system based on past RE games. use `re4m_thirdperson` and `re4m_movement` to use it in game
+- *Parrying*: Parry bosses and enemy attacks like the GOAT leon, bind `bind G re4m_parry` to use it in game.
 
 ## Beta Status
 
 **_This is an open public beta — still in active development and also my very first gamemode I've ever made. Expect bugs, missing assets, and balance tweaks. Feedback and bug reports are very welcome!_**
+**_all mode updates will stay here first until it is ready for final update release on the workshop version, Content pack still required_**
 
 ## Installation
 
