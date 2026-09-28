@@ -2,6 +2,90 @@
 
 local MainMenuFrame = nil
 local currentTab = "loadout"
+local lobbySection = "players"
+
+local function RequestLobbyProgression()
+    if not IsValid(LocalPlayer()) then return end
+    net.Start("RE4M_RequestProgression")
+    net.SendToServer()
+end
+
+local function IsReadyPlayerLockedToLobby()
+    local ply = LocalPlayer()
+    if not IsValid(ply) or not ply:RE4M_GetReady() then return false end
+
+    local startAt = GetGlobalFloat("RE4M_LobbyStartAt", 0)
+    if startAt <= 0 then return false end
+
+    local readyCount = GetGlobalInt("RE4M_LobbyReadyCount", 0)
+    local required = math.max(GetGlobalInt("RE4M_LobbyReadyRequired", 1), 1)
+    return readyCount >= required
+end
+
+local function FitPreviewCamera(panel, ent, distanceScale)
+    if not IsValid(panel) or not IsValid(ent) then return end
+
+    local mins, maxs = ent:OBBMins(), ent:OBBMaxs()
+    if not mins or not maxs then mins, maxs = ent:GetRenderBounds() end
+
+    local center = (mins + maxs) * 0.5
+    local size = (maxs - mins):Length()
+    local radius = math.max(size * 0.5, 8)
+    local fov = math.rad(panel:GetFOV())
+    local distance = radius / math.max(math.tan(fov * 0.5), 0.1) * (distanceScale or 1.15)
+
+    panel.PreviewLookAt = center
+    panel.PreviewBaseDistance = distance
+    panel.PreviewDistance = distance
+    panel:SetLookAt(center)
+    panel:SetCamPos(center + Vector(distance, 0, distance * 0.08))
+end
+
+local function EnablePreviewControls(panel)
+    panel:SetMouseInputEnabled(true)
+    panel.PreviewYaw = 0
+    panel.PreviewPitch = 0
+    panel.PreviewDragging = false
+
+    panel.OnMousePressed = function(self, code)
+        if code ~= MOUSE_LEFT then return end
+        self.PreviewDragging = true
+        self.PreviewLastX, self.PreviewLastY = gui.MousePos()
+        self:MouseCapture(true)
+    end
+
+    panel.OnCursorMoved = function(self, x, y)
+        if not self.PreviewDragging then return end
+        local mouseX, mouseY = gui.MousePos()
+        local dx = mouseX - (self.PreviewLastX or mouseX)
+        local dy = mouseY - (self.PreviewLastY or mouseY)
+        self.PreviewLastX, self.PreviewLastY = mouseX, mouseY
+        self.PreviewYaw = (self.PreviewYaw or 0) + dx * 0.5
+        self.PreviewPitch = math.Clamp((self.PreviewPitch or 0) - dy * 0.35, -45, 45)
+    end
+
+    panel.OnMouseReleased = function(self, code)
+        if code ~= MOUSE_LEFT then return end
+        self.PreviewDragging = false
+        self:MouseCapture(false)
+    end
+
+    panel.OnMouseWheeled = function(self, delta)
+        if not self.PreviewBaseDistance then return false end
+        local factor = delta > 0 and 0.85 or 1.18
+        self.PreviewDistance = math.Clamp(self.PreviewDistance * factor,
+            self.PreviewBaseDistance * 0.35, self.PreviewBaseDistance * 3.5)
+        local center = self.PreviewLookAt or vector_origin
+        local distance = self.PreviewDistance
+        self:SetCamPos(center + Vector(distance, 0, distance * 0.08))
+        return true
+    end
+
+    panel.LayoutEntity = function(self, ent)
+        if self.bAnimated then self:RunAnimation() end
+        ent:SetAngles(Angle(self.PreviewPitch or 0, self.PreviewYaw or 0, 0))
+    end
+end
 
 -- ============================================
 -- MENU MANAGEMENT
@@ -16,6 +100,7 @@ function RE4M_OpenMainMenu()
     RE4M_PlayMenuMusic()
 
     local sw, sh = ScrW(), ScrH()
+    local contentPanel
 
     MainMenuFrame = vgui.Create("DFrame")
     MainMenuFrame:SetSize(sw, sh)
@@ -24,6 +109,13 @@ function RE4M_OpenMainMenu()
     MainMenuFrame:SetDraggable(false)
     MainMenuFrame:ShowCloseButton(false)
     MainMenuFrame:MakePopup()
+    MainMenuFrame.Think = function()
+        if IsReadyPlayerLockedToLobby() and currentTab ~= "lobby" then
+            currentTab = "lobby"
+            RE4M_RefreshMenuContent(contentPanel)
+            RequestLobbyProgression()
+        end
+    end
 
         -- Background paint
     local bgMat = Material("vgui/re4mercs/background.png", "smooth")
@@ -86,7 +178,7 @@ function RE4M_OpenMainMenu()
         surface.DrawRect(w / 2 - 200, 155, 400, 2)
     end
 
-    local contentPanel = vgui.Create("DPanel", MainMenuFrame)
+    contentPanel = vgui.Create("DPanel", MainMenuFrame)
     contentPanel:SetPos(sw * 0.05, 180)
     contentPanel:SetSize(sw * 0.9, sh - 280)
     contentPanel.Paint = function(self, w, h)
@@ -99,33 +191,46 @@ function RE4M_OpenMainMenu()
     tabBar.Paint = function() end
 
     local tabs = {
+        { id = "lobby",       label = "LOBBY" },
         { id = "loadout",     label = "LOADOUT" },
         { id = "playermodel", label = "PLAYER MODEL" },
         { id = "theme",       label = "MAP THEME" },
     }
 
     for i, tab in ipairs(tabs) do
+        local tabData = tab
         local tabBtn = vgui.Create("DButton", tabBar)
         tabBtn:SetPos((i - 1) * 205, 0)
         tabBtn:SetSize(200, 28)
-        tabBtn:SetText(tab.label)
+        tabBtn:SetText(tabData.label)
         tabBtn:SetFont("RE4M_Small")
         tabBtn:SetTextColor(Color(255, 255, 255))
 
         tabBtn.Paint = function(self, w, h)
-            local bg = currentTab == tab.id
+            local bg = currentTab == tabData.id
                 and Color(180, 40, 40, 220)
                 or  Color(60, 30, 30, 180)
 
-            if self:IsHovered() and currentTab ~= tab.id then
+            if self:IsHovered() and currentTab ~= tabData.id then
                 bg = Color(120, 40, 40, 200)
             end
             draw.RoundedBoxEx(6, 0, 0, w, h, bg, true, true, false, false)
         end
 
+        tabBtn.Think = function(self)
+            self:SetEnabled(not (tabData.id ~= "lobby" and IsReadyPlayerLockedToLobby()))
+        end
+
         tabBtn.DoClick = function()
-            if tab.id == "theme" and not LocalPlayer():RE4M_IsAdmin() then return end
-            currentTab = tab.id
+            if tabData.id ~= "lobby" and IsReadyPlayerLockedToLobby() then
+                currentTab = "lobby"
+                RE4M_RefreshMenuContent(contentPanel)
+                RequestLobbyProgression()
+                return
+            end
+            if tabData.id == "theme" and not LocalPlayer():RE4M_IsAdmin() then return end
+            currentTab = tabData.id
+            if tabData.id == "lobby" then RequestLobbyProgression() end
             RE4M_RefreshMenuContent(contentPanel)
         end
     end
@@ -157,6 +262,8 @@ function RE4M_OpenMainMenu()
         draw.RoundedBox(8, 0, 0, w, h, bg)
         surface.SetDrawColor(255, 255, 255, 60)
         surface.DrawOutlinedRect(0, 0, w, h, 2)
+        draw.SimpleText(self:GetText(), self:GetFont(), w / 2, h / 2,
+            Color(255, 255, 255), TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
     end
 
     readyBtn.DoClick = function()
@@ -164,6 +271,7 @@ function RE4M_OpenMainMenu()
         net.Start("RE4M_PlayerReady")
             net.WriteBool(newReady)
         net.SendToServer()
+        if newReady then RE4M_PlayUISound("ui/ui_ready.wav", "ui/btn_click.wav") end
     end
 
     readyBtn.Think = function(self)
@@ -174,27 +282,48 @@ function RE4M_OpenMainMenu()
         end
     end
 
-    if LocalPlayer():RE4M_IsAdmin() then
-        local startBtn = vgui.Create("DButton", bottomPanel)
-        startBtn:SetSize(280, 50)
-        startBtn:SetPos(sw * 0.9 - 280, 10)
-        startBtn:SetText("START GAME")
-        startBtn:SetFont("RE4M_MenuButton")
-        startBtn:SetTextColor(Color(255, 255, 255))
+    local startBtn = vgui.Create("DButton", bottomPanel)
+    startBtn:SetSize(280, 50)
+    startBtn:SetPos(sw * 0.9 - 280, 10)
+    startBtn:SetFont("RE4M_MenuButton")
+    startBtn:SetTextColor(Color(255, 255, 255))
+    startBtn:SetEnabled(false)
 
-        startBtn.Paint = function(self, w, h)
-            local bg = self:IsHovered()
-                and Color(220, 60, 60, 240)
-                or  Color(180, 40, 40, 220)
-            draw.RoundedBox(8, 0, 0, w, h, bg)
-            surface.SetDrawColor(255, 100, 100, 100)
-            surface.DrawOutlinedRect(0, 0, w, h, 2)
-        end
+    startBtn.Paint = function(self, w, h)
+        local ready = self:IsEnabled()
+        local bg = ready and (self:IsHovered()
+            and Color(220, 60, 60, 240)
+            or Color(180, 40, 40, 220)) or Color(75, 55, 55, 200)
+        draw.RoundedBox(8, 0, 0, w, h, bg)
+        surface.SetDrawColor(255, 100, 100, ready and 100 or 35)
+        surface.DrawOutlinedRect(0, 0, w, h, 2)
+        draw.SimpleText(self:GetText(), self:GetFont(), w / 2, h / 2,
+            ready and Color(255, 255, 255) or Color(190, 175, 175),
+            TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+    end
 
-        startBtn.DoClick = function()
-            net.Start("RE4M_StartGame")
-            net.SendToServer()
+    startBtn.Think = function(self)
+        local readyCount = GetGlobalInt("RE4M_LobbyReadyCount", 0)
+        local required = math.max(GetGlobalInt("RE4M_LobbyReadyRequired", 1), 1)
+        if readyCount < required then
+            self:SetEnabled(false)
+            self:SetText("READY UP (" .. readyCount .. "/" .. required .. ")")
+        else
+            local remaining = math.ceil(GetGlobalFloat("RE4M_LobbyStartAt", 0) - CurTime())
+            if remaining > 0 then
+                self:SetEnabled(false)
+                self:SetText("STARTING IN " .. remaining)
+            else
+                self:SetEnabled(false)
+                self:SetText("STARTING MATCH...")
+            end
         end
+    end
+
+    startBtn.DoClick = function()
+        if not startBtn:IsEnabled() then return end
+        net.Start("RE4M_StartGame")
+        net.SendToServer()
     end
 
     local playerListPanel = vgui.Create("DPanel", bottomPanel)
@@ -210,7 +339,7 @@ function RE4M_OpenMainMenu()
             local ready = ply:RE4M_GetReady()
             local col   = ready and Color(50, 255, 50) or Color(200, 200, 200)
             local icon  = ready and "✓ " or "○ "
-            local text  = icon .. ply:Nick()
+            local text  = icon .. ply:Nick() .. "  Lv." .. ply:GetNWInt("RE4M_PlayerLevel", 1)
 
             draw.SimpleText(text, "RE4M_Small", x, h / 2, col,
                 TEXT_ALIGN_LEFT, TEXT_ALIGN_CENTER)
@@ -223,6 +352,7 @@ function RE4M_OpenMainMenu()
     end
 
     RE4M_RefreshMenuContent(contentPanel)
+    RequestLobbyProgression()
 end
 
 function RE4M_CloseMainMenu()
@@ -242,10 +372,383 @@ function RE4M_RefreshMenuContent(parent)
         RE4M_CreateLoadoutPanel(parent)
     elseif currentTab == "playermodel" then
         RE4M_CreatePlayermodelPanel(parent)
+    elseif currentTab == "lobby" then
+        RE4M_CreateLobbyPanel(parent)
     elseif currentTab == "theme" then
         RE4M_CreateThemePanel(parent)
     end
 end
+
+-- ============================================
+-- LOBBY MODEL VIEW
+-- ============================================
+
+function RE4M_CreateLobbyPanel(parent)
+    local pw, ph = parent:GetSize()
+    local players = player.GetAll()
+    parent.ProgressionRevision = RE4M_CLIENT.ProgressionRevision or 0
+    parent.Think = function(self)
+        local revision = RE4M_CLIENT.ProgressionRevision or 0
+        if currentTab == "lobby" and self.ProgressionRevision ~= revision then
+            RE4M_RefreshMenuContent(self)
+        end
+    end
+
+    local header = vgui.Create("DPanel", parent)
+    header:SetPos(10, 8)
+    header:SetSize(pw - 20, 28)
+    header.Paint = function(self, w, h)
+        local title = lobbySection == "shop" and "MERC POINTS  •  SKILL SHOP"
+            or (lobbySection == "equipped" and "EQUIPPED PERKS" or "LOBBY")
+        draw.SimpleText(title, "RE4M_Medium", w / 2, 0,
+            Color(255, 90, 90), TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP)
+    end
+
+    local sectionButton = vgui.Create("DButton", header)
+    sectionButton:SetPos(0, 0)
+    sectionButton:SetSize(105, 25)
+    sectionButton:SetText("PLAYERS")
+    sectionButton:SetFont("RE4M_Tiny")
+    sectionButton:SetTextColor(Color(255, 255, 255))
+    sectionButton.Paint = function(self, w, h)
+        draw.RoundedBox(4, 0, 0, w, h, self:IsHovered() and Color(150, 45, 45) or Color(70, 30, 30))
+    end
+    sectionButton.DoClick = function()
+        lobbySection = "players"
+        RE4M_RefreshMenuContent(parent)
+    end
+
+    local function AddLobbySectionButton(label, id, x, width)
+        local button = vgui.Create("DButton", header)
+        button:SetPos(x, 0)
+        button:SetSize(width, 25)
+        button:SetText(label)
+        button:SetFont("RE4M_Tiny")
+        button:SetTextColor(Color(255, 255, 255))
+        button.Paint = function(self, w, h)
+            local active = lobbySection == id
+            draw.RoundedBox(4, 0, 0, w, h,
+                active and Color(150, 45, 45) or (self:IsHovered() and Color(115, 40, 40) or Color(70, 30, 30)))
+        end
+        button.DoClick = function()
+            lobbySection = id
+            RE4M_RefreshMenuContent(parent)
+        end
+        return button
+    end
+    AddLobbySectionButton("SKILL SHOP", "shop", 112, 112)
+    AddLobbySectionButton("EQUIPPED SKILLS", "equipped", 231, 145)
+
+    local localPlayer = LocalPlayer()
+    local localKey = IsValid(localPlayer) and localPlayer:SteamID64() or ""
+    if localKey == "0" and IsValid(localPlayer) then localKey = localPlayer:SteamID() end
+    local localProfile = (RE4M_CLIENT.ProgressionProfiles or {})[localKey] or {}
+    -- The replicated player field is authoritative for the local player's
+    -- ownership, including when a broadcast snapshot refreshed the lobby cache.
+    if IsValid(localPlayer) then
+        local ownedJson = localPlayer:GetNWString("RE4M_OwnedSkills", "[]")
+        local ownedSkills = util.JSONToTable(ownedJson) or {}
+        if istable(ownedSkills) then
+            localProfile = table.Copy(localProfile)
+            localProfile.ownedSkills = ownedSkills
+        end
+        local equippedSkills = {}
+        for slot = 1, 3 do
+            local skillID = localPlayer:GetNWString("RE4M_EquippedSkill" .. slot, "")
+            if skillID ~= "" then equippedSkills[#equippedSkills + 1] = skillID end
+        end
+        if #equippedSkills > 0 or istable(localProfile.equippedSkills) then
+            localProfile = table.Copy(localProfile)
+            localProfile.equippedSkills = equippedSkills
+        end
+    end
+    local balance = vgui.Create("DLabel", header)
+    balance:SetPos(pw - 255, 2)
+    balance:SetSize(245, 22)
+    balance:SetText("MP: " .. tostring(localProfile.mercPoints or (IsValid(localPlayer) and localPlayer:GetNWInt("RE4M_MercPoints", 0)) or 0) ..
+        "   Equipped: " .. #(localProfile.equippedSkills or {}) .. "/3")
+    balance:SetFont("RE4M_Small")
+    balance:SetTextColor(Color(255, 220, 100))
+    balance:SetContentAlignment(6)
+
+    if lobbySection == "shop" or lobbySection == "equipped" then
+        local scroll = vgui.Create("DScrollPanel", parent)
+        scroll:SetPos(10, 40)
+        scroll:SetSize(pw - 20, ph - 50)
+        local layout = vgui.Create("DIconLayout", scroll)
+        layout:SetPos(0, 0)
+        layout:SetSize(scroll:GetWide() - 10, ph)
+        layout:SetSpaceX(8)
+        layout:SetSpaceY(8)
+        local skills = RE4M_SKILLS or {}
+        local cardWidth = math.max(220, math.floor((pw - 55) / 3))
+        local ownedCount = 0
+        for _, skill in ipairs(skills) do
+            local skillData = skill
+            local owned = table.HasValue(localProfile.ownedSkills or {}, skillData.id)
+            local equipped = table.HasValue(localProfile.equippedSkills or {}, skillData.id)
+            if lobbySection == "equipped" and not owned then continue end
+            ownedCount = ownedCount + 1
+            local card = layout:Add("DPanel")
+            card:SetSize(cardWidth, 125)
+            card.Paint = function(self, w, h)
+                draw.RoundedBox(5, 0, 0, w, h, Color(25, 14, 16, 245))
+                surface.SetDrawColor(equipped and Color(150, 85, 225, 180) or Color(150, 45, 45, 100))
+                surface.DrawOutlinedRect(0, 0, w, h, 1)
+                draw.SimpleText(skillData.name, "RE4M_Small", 9, 8, Color(255, 220, 220), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+                draw.SimpleText(owned and (equipped and "EQUIPPED" or "OWNED") or (skillData.cost .. " MP"), "RE4M_Tiny", 9, h - 28,
+                    equipped and Color(210, 160, 255) or Color(255, 220, 100), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+            end
+            local description = vgui.Create("DLabel", card)
+            description:SetPos(9, 31)
+            description:SetSize(cardWidth - 18, 53)
+            description:SetFont("RE4M_Tiny")
+            description:SetText(skillData.description)
+            description:SetTextColor(Color(220, 210, 210))
+            description:SetWrap(true)
+            description:SetAutoStretchVertical(false)
+            description:SetContentAlignment(7)
+            local action = vgui.Create("DButton", card)
+            action:SetPos(cardWidth - 105, 91)
+            action:SetSize(96, 26)
+            action:SetText(lobbySection == "equipped" and (equipped and "UNEQUIP" or "EQUIP")
+                or (owned and (equipped and "UNEQUIP" or "EQUIP") or "BUY"))
+            action:SetFont("RE4M_Tiny")
+            action:SetTextColor(Color(255, 255, 255))
+            -- Leave Buy clickable even if our cached balance is stale; the
+            -- server validates the purchase and returns the current result.
+            local atEquipLimit = #(localProfile.equippedSkills or {}) >= 3
+            action:SetEnabled(not owned or equipped or not atEquipLimit)
+            action.Paint = function(self, w, h)
+                draw.RoundedBox(3, 0, 0, w, h, self:IsEnabled() and (self:IsHovered() and Color(170, 55, 55) or Color(110, 38, 38)) or Color(55, 45, 45))
+            end
+            action.DoClick = function()
+                if not owned then
+                    net.Start("RE4M_BuySkill")
+                    net.WriteString(skillData.id)
+                    net.SendToServer()
+                    return
+                end
+
+                local selected = {}
+                local seen = {}
+                for slot = 1, 3 do
+                    local activeID = IsValid(localPlayer) and localPlayer:GetNWString("RE4M_EquippedSkill" .. slot, "") or ""
+                    if activeID == "" then activeID = (localProfile.equippedSkills or {})[slot] or "" end
+                    if activeID ~= "" and activeID ~= skillData.id and not seen[activeID] then
+                        selected[#selected + 1] = activeID
+                        seen[activeID] = true
+                    end
+                end
+                if not equipped then
+                    if #selected >= 3 then
+                        notification.AddLegacy("Unequip a skill before selecting another.", NOTIFY_ERROR, 4)
+                        return
+                    end
+                    selected[#selected + 1] = skillData.id
+                end
+
+                net.Start("RE4M_SetEquippedSkills")
+                    net.WriteUInt(#selected, 2)
+                    for _, selectedID in ipairs(selected) do net.WriteString(selectedID) end
+                net.SendToServer()
+            end
+        end
+        if lobbySection == "equipped" and ownedCount == 0 then
+            local empty = vgui.Create("DLabel", parent)
+            empty:SetPos(20, 58)
+            empty:SetSize(pw - 40, 32)
+            empty:SetFont("RE4M_Small")
+            empty:SetText("No skills purchased yet. Open Skill Shop to buy and equip perks.")
+            empty:SetTextColor(Color(220, 205, 220))
+            empty:SetContentAlignment(5)
+        end
+        return
+    end
+
+    if #players == 0 then
+        local empty = vgui.Create("DLabel", parent)
+        empty:SetPos(20, 50)
+        empty:SetSize(pw - 40, 30)
+        empty:SetFont("RE4M_Small")
+        empty:SetText("Waiting for players...")
+        empty:SetTextColor(Color(220, 220, 220))
+        empty:SetContentAlignment(5)
+        return
+    end
+
+    -- A single shared room backdrop sits behind every player preview so the
+    -- characters read as one lobby lineup instead of separate model cards.
+    local room = vgui.Create("DPanel", parent)
+    room:SetPos(10, 40)
+    room:SetSize(pw - 20, ph - 50)
+    local roomMaterial = Material("vgui/re4mercs/background_lobby.png", "smooth")
+    room.Paint = function(self, w, h)
+        if roomMaterial and not roomMaterial:IsError() then
+            surface.SetDrawColor(255, 255, 255, 255)
+            surface.SetMaterial(roomMaterial)
+            surface.DrawTexturedRect(0, 0, w, h)
+        else
+            draw.RoundedBox(5, 0, 0, w, h, Color(18, 20, 22, 255))
+        end
+
+        surface.SetDrawColor(0, 0, 0, 55)
+        surface.DrawRect(0, 0, w, h)
+        surface.SetDrawColor(0, 0, 0, 105)
+        surface.DrawOutlinedRect(0, 0, w, h, 3)
+    end
+
+    local scroll = vgui.Create("DScrollPanel", parent)
+    scroll:SetPos(10, 40)
+    scroll:SetSize(pw - 20, ph - 50)
+    scroll.Paint = function() end
+
+    local gap = 10
+    local columns = math.min(#players, math.max(1, math.floor((pw - 20 + gap) / (280 + gap))))
+    local cardWidth = math.floor((pw - 20 - (columns - 1) * gap) / columns)
+    local cardHeight = math.max(340, ph - 65)
+    local modelHeight = cardHeight - 130
+    local layout = vgui.Create("DIconLayout", scroll)
+    layout:SetPos(0, 0)
+    layout:SetSize(scroll:GetWide() - 10,
+        math.ceil(#players / columns) * (cardHeight + gap))
+    layout:SetSpaceX(gap)
+    layout:SetSpaceY(gap)
+
+    local profiles = RE4M_CLIENT.ProgressionProfiles or {}
+    local function GetPlayerKey(ply)
+        local key = ply:SteamID64()
+        if not key or key == "0" then key = ply:SteamID() end
+        return key
+    end
+
+    for _, ply in ipairs(players) do
+        if not IsValid(ply) then continue end
+        local lobbyPlayer = ply
+
+        local card = layout:Add("DPanel")
+        card:SetSize(cardWidth, cardHeight)
+        card.Paint = function(self, w, h)
+            draw.RoundedBoxEx(5, 0, modelHeight + 5, w, h - modelHeight - 5,
+                Color(17, 10, 11, 220), false, false, true, true)
+            surface.SetDrawColor(155, 45, 45, 135)
+            surface.DrawOutlinedRect(0, modelHeight + 5, w, h - modelHeight - 5, 1)
+        end
+
+        local playerModelPath = lobbyPlayer:GetModel()
+        if not isstring(playerModelPath) or playerModelPath == "" then
+            playerModelPath = "models/player/kleiner.mdl"
+        end
+
+        local modelPanel = vgui.Create("DModelPanel", card)
+        modelPanel:SetPos(0, 0)
+        modelPanel:SetSize(cardWidth, modelHeight)
+        modelPanel:SetFOV(36)
+        modelPanel:SetAnimated(true)
+        modelPanel:SetModel(playerModelPath)
+        modelPanel:SetMouseInputEnabled(false)
+        modelPanel.LayoutEntity = function(self, ent)
+            if self.bAnimated then self:RunAnimation() end
+            ent:SetAngles(Angle(0, 12 + math.sin(CurTime() * 0.45) * 3, 0))
+        end
+
+        timer.Simple(0, function()
+            if not IsValid(modelPanel) or not IsValid(modelPanel.Entity) then return end
+            local ent = modelPanel.Entity
+            local idleSequence = ent:LookupSequence("menu_idle")
+            if not idleSequence or idleSequence < 0 then
+                idleSequence = ent:LookupSequence("idle_all_01")
+            end
+            if idleSequence and idleSequence >= 0 then
+                ent:ResetSequence(idleSequence)
+                ent:SetCycle(0)
+                ent:SetPlaybackRate(1)
+            end
+            ent:SetSkin(IsValid(lobbyPlayer) and lobbyPlayer:GetSkin() or 0)
+            if IsValid(lobbyPlayer) then
+                pcall(function()
+                    for group = 0, lobbyPlayer:GetNumBodyGroups() - 1 do
+                        ent:SetBodygroup(group, lobbyPlayer:GetBodygroup(group))
+                    end
+                end)
+            end
+            FitPreviewCamera(modelPanel, ent, 2.2)
+            local mins, maxs = ent:OBBMins(), ent:OBBMaxs()
+            if mins and maxs then
+                local waistLookAt = Vector(0, 0, Lerp(0.52, mins.z, maxs.z))
+                local distance = modelPanel.PreviewDistance or 0
+                local cameraOffset = Vector(distance, 0, distance * 0.08)
+                modelPanel.PreviewLookAt = waistLookAt
+                modelPanel:SetLookAt(waistLookAt)
+                modelPanel:SetCamPos(waistLookAt + cameraOffset)
+            end
+        end)
+        local key = GetPlayerKey(lobbyPlayer)
+        local profile = profiles[key] or {}
+        local weaponRows = {}
+        local loadout = istable(profile.loadout) and profile.loadout or {}
+        for _, weaponClass in ipairs(loadout) do
+            local weaponData = profile.weapons and profile.weapons[weaponClass] or nil
+            local weapon = weapons.GetStored(weaponClass)
+            local weaponName = weapon and weapon.PrintName or weaponClass
+            if isstring(weaponName) and string.StartWith(weaponName, "#") then
+                weaponName = language.GetPhrase(string.sub(weaponName, 2))
+            end
+            weaponRows[#weaponRows + 1] = string.format("%s  Lv.%d",
+                weaponName, tonumber(weaponData and weaponData.level) or 1)
+        end
+
+        local info = vgui.Create("DPanel", card)
+        info:SetPos(9, modelHeight + 10)
+        info:SetSize(cardWidth - 18, cardHeight - modelHeight - 15)
+        info.Paint = function(self, w, h)
+            if not IsValid(lobbyPlayer) then return end
+            local ready = lobbyPlayer:RE4M_GetReady()
+            local playerLevel = lobbyPlayer:GetNWInt("RE4M_PlayerLevel", tonumber(profile.level) or 1)
+            draw.SimpleText(lobbyPlayer:Nick(), "RE4M_Small", 3, 2,
+                Color(255, 255, 255), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+            draw.SimpleText("PLAYER  Lv." .. playerLevel .. (ready and "  •  READY" or ""),
+                "RE4M_Tiny", 3, 23,
+                ready and Color(125, 255, 125) or Color(255, 205, 120),
+                TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+
+            local equipped = istable(profile.equippedSkills) and profile.equippedSkills or {}
+            if #equipped > 0 then
+                local labels = {}
+                for _, id in ipairs(equipped) do
+                    local data = RE4M_SKILLS_BY_ID and RE4M_SKILLS_BY_ID[id]
+                    labels[#labels + 1] = data and data.name or id
+                end
+                draw.SimpleText("SKILLS: " .. table.concat(labels, ", "), "RE4M_Tiny", 3, 42,
+                    Color(215, 175, 255), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+            else
+                draw.SimpleText("SKILLS: none equipped", "RE4M_Tiny", 3, 42,
+                    Color(175, 165, 175), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+            end
+
+            if #weaponRows == 0 then
+                draw.SimpleText("No weapons selected", "RE4M_Tiny", 3, 61,
+                    Color(190, 180, 180), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+            else
+                for i = 1, math.min(#weaponRows, 3) do
+                    draw.SimpleText(weaponRows[i], "RE4M_Tiny", 3, 61 + ((i - 1) * 13),
+                        Color(220, 200, 255), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+                end
+            end
+        end
+    end
+end
+
+net.Receive("RE4M_SkillShopResult", function()
+    local success = net.ReadBool()
+    local message = net.ReadString()
+    if notification and notification.AddLegacy then
+        notification.AddLegacy(message, success and NOTIFY_GENERIC or NOTIFY_ERROR, 4)
+        surface.PlaySound(success and "buttons/button15.wav" or "buttons/button10.wav")
+    else
+        chat.AddText(success and Color(120, 255, 120) or Color(255, 120, 120), "[Merc Shop] " .. message)
+    end
+end)
 
 -- ============================================
 -- LOADOUT TAB
@@ -302,6 +805,7 @@ function RE4M_CreateLoadoutPanel(parent)
     weaponList:AddColumn("Name"):SetWidth(200)
     weaponList:AddColumn("Category"):SetWidth(120)
     weaponList:AddColumn("Class"):SetWidth(150)
+    weaponList:AddColumn("Level"):SetWidth(70)
 
     weaponList.Paint = function(self, w, h)
         draw.RoundedBox(4, 0, 0, w, h, Color(20, 10, 10, 220))
@@ -326,6 +830,13 @@ function RE4M_CreateLoadoutPanel(parent)
         local search = string.lower(searchBar:GetValue() or "")
         local category = categoryFilter:GetSelected()
         category = category or "All Categories"
+        local localPlayer = LocalPlayer()
+        local profileKey = IsValid(localPlayer) and localPlayer:SteamID64() or nil
+        if not profileKey or profileKey == "0" then
+            profileKey = IsValid(localPlayer) and localPlayer:SteamID() or ""
+        end
+        local localProfile = (RE4M_CLIENT.ProgressionProfiles or {})[profileKey]
+        local weaponLevels = localProfile and localProfile.weapons or {}
 
         for _, wep in ipairs(RE4M_CLIENT.WeaponList) do
             local matchSearch = search == ""
@@ -336,13 +847,24 @@ function RE4M_CreateLoadoutPanel(parent)
                 or wep.category == category
 
             if matchSearch and matchCategory then
-                local line = weaponList:AddLine(wep.name, wep.category, wep.class)
+                local weaponProgress = weaponLevels[wep.class]
+                local weaponLevel = tonumber(weaponProgress and weaponProgress.level) or 1
+                local line = weaponList:AddLine(wep.name, wep.category, wep.class, "Lv." .. weaponLevel)
                 line.WeaponData = wep
             end
         end
     end
 
     PopulateWeapons()
+    weaponList.LastProgressionRevision = RE4M_CLIENT.ProgressionRevision or 0
+    weaponList.Think = function(self)
+        local revision = RE4M_CLIENT.ProgressionRevision or 0
+        if revision == self.LastProgressionRevision then return end
+        self.LastProgressionRevision = revision
+        timer.Simple(0, function()
+            if IsValid(self) then PopulateWeapons() end
+        end)
+    end
     searchBar.OnChange       = function() PopulateWeapons() end
     categoryFilter.OnSelect  = function() timer.Simple(0, function() PopulateWeapons() end) end
 
@@ -432,13 +954,26 @@ function RE4M_CreateLoadoutPanel(parent)
     local wepPreview    = nil
 
     if previewHeight > 80 then
+        local weaponPreviewBackground = vgui.Create("DPanel", loadoutPanel)
+        weaponPreviewBackground:SetPos(10, previewY + 16)
+        weaponPreviewBackground:SetSize(loadoutPanel:GetWide() - 20, previewHeight - 20)
+        weaponPreviewBackground.Paint = function(self, w, h)
+            draw.RoundedBox(6, 0, 0, w, h, Color(20, 10, 10, 220))
+        end
+
         wepPreview = vgui.Create("DModelPanel", loadoutPanel)
         wepPreview:SetPos(10, previewY + 16)
         wepPreview:SetSize(loadoutPanel:GetWide() - 20, previewHeight - 20)
-        wepPreview:SetFOV(60)
-        wepPreview.Paint = function(self, w, h)
-            draw.RoundedBox(6, 0, 0, w, h, Color(20, 10, 10, 220))
-        end
+        wepPreview:SetFOV(48)
+        EnablePreviewControls(wepPreview)
+
+        local weaponPreviewHint = vgui.Create("DLabel", loadoutPanel)
+        weaponPreviewHint:SetPos(10, previewY + 18)
+        weaponPreviewHint:SetSize(loadoutPanel:GetWide() - 20, 16)
+        weaponPreviewHint:SetFont("RE4M_Tiny")
+        weaponPreviewHint:SetTextColor(Color(210, 210, 210, 170))
+        weaponPreviewHint:SetText("DRAG TO ROTATE  •  WHEEL TO ZOOM")
+        weaponPreviewHint:SetContentAlignment(8)
     end
 
     weaponList.OnRowSelected = function(panel, rowIndex, row)
@@ -463,12 +998,13 @@ function RE4M_CreateLoadoutPanel(parent)
             wepPreview:SetModel(row.WeaponData.model)
             local ent = wepPreview.Entity
             if IsValid(ent) then
-                local mn, mx = ent:GetRenderBounds()
-                local center = (mn + mx) / 2
-                local size   = (mx - mn):Length()
-                wepPreview:SetCamPos(Vector(size * 0.5, size * 0.3, size * 0.2))
-                wepPreview:SetLookAt(center)
+                FitPreviewCamera(wepPreview, ent, 1.35)
             end
+
+            timer.Simple(0, function()
+                if not IsValid(wepPreview) then return end
+                FitPreviewCamera(wepPreview, wepPreview.Entity, 1.35)
+            end)
         end
 
         surface.PlaySound("ui/btn_click.wav")
@@ -507,6 +1043,7 @@ function RE4M_CreatePlayermodelPanel(parent)
     local state = {
         modelPath   = GetConVar("re4m_playermodel"):GetString() or "",
         modelName   = "",
+        voxPackPath = "",
         skin        = GetConVar("re4m_playerskin"):GetInt() or 0,
         bodygroups  = RE4M_ParseBodygroups(GetConVar("re4m_playerbodygroups"):GetString() or ""),
         playerColor = Vector(
@@ -525,6 +1062,40 @@ function RE4M_CreatePlayermodelPanel(parent)
     -- ========================================
     local allModels = player_manager.AllValidModels() or {}
 
+    -- Keep the saved/current model selectable even when another add-on
+    -- changed it without registering it in player_manager.AllValidModels().
+    local currentModel = IsValid(LocalPlayer()) and LocalPlayer():GetModel() or ""
+    local function HasModelPath(path)
+        path = string.lower(path or "")
+        for _, registeredPath in pairs(allModels) do
+            if isstring(registeredPath) and string.lower(registeredPath) == path then
+                return true
+            end
+        end
+        return false
+    end
+
+    if state.modelPath ~= "" and not HasModelPath(state.modelPath) then
+        if util.IsValidModel(state.modelPath) then
+            allModels["Current Selection"] = state.modelPath
+        else
+            state.modelPath = currentModel
+        end
+    end
+
+    if currentModel ~= "" and not HasModelPath(currentModel) then
+        allModels["Current Model"] = currentModel
+    end
+
+    if state.modelPath == "" then
+        for _, modelPath in pairs(allModels) do
+            if isstring(modelPath) and modelPath ~= "" then
+                state.modelPath = modelPath
+                break
+            end
+        end
+    end
+
     -- If player_manager returned nothing, add at least the HL2 defaults
     if table.Count(allModels) == 0 then
         allModels = {
@@ -542,6 +1113,15 @@ function RE4M_CreatePlayermodelPanel(parent)
             ["Combine Prison Guard"] = "models/player/combine_soldier_prisonguard.mdl",
             ["Combine Elite"] = "models/player/combine_super_soldier.mdl",
         }
+    end
+
+    if state.modelPath == "" then
+        for _, modelPath in pairs(allModels) do
+            if isstring(modelPath) and modelPath ~= "" then
+                state.modelPath = modelPath
+                break
+            end
+        end
     end
 
     -- ========================================
@@ -606,46 +1186,30 @@ function RE4M_CreatePlayermodelPanel(parent)
             w / 2, 5, Color(255, 255, 255), TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP)
     end
 
+    local modelPreviewBackground = vgui.Create("DPanel", previewPanel)
+    modelPreviewBackground:SetPos(5, 25)
+    modelPreviewBackground:SetSize(previewPanel:GetWide() - 10, previewPanel:GetTall() - 100)
+    modelPreviewBackground.Paint = function(self, w, h)
+        draw.RoundedBox(6, 0, 0, w, h, Color(15, 8, 8, 240))
+    end
+
     local mdlPanel = vgui.Create("DModelPanel", previewPanel)
     mdlPanel:SetPos(5, 25)
     mdlPanel:SetSize(previewPanel:GetWide() - 10, previewPanel:GetTall() - 100)
-    mdlPanel:SetFOV(36)
+    mdlPanel:SetFOV(42)
     mdlPanel:SetAnimated(true)
+    EnablePreviewControls(mdlPanel)
     mdlPanel:SetDirectionalLight(BOX_TOP,   Color(255, 255, 255))
     mdlPanel:SetDirectionalLight(BOX_FRONT, Color(220, 220, 220))
     mdlPanel:SetAmbientLight(Color(90, 90, 90))
 
-    mdlPanel.Paint = function(self, w, h)
-        draw.RoundedBox(6, 0, 0, w, h, Color(15, 8, 8, 240))
-    end
-
-    -- Drag-to-rotate + auto-rotate
-    local lastDragTime = 0
-
-    mdlPanel.DragMousePress = function(self)
-        self.PressX  = gui.MousePos()
-        self.Pressed = true
-        lastDragTime = CurTime()
-    end
-
-    mdlPanel.DragMouseRelease = function(self)
-        self.Pressed = false
-        lastDragTime = CurTime()
-    end
-
-    mdlPanel.LayoutEntity = function(self, ent)
-        if self.bAnimated then self:RunAnimation() end
-
-        if self.Pressed then
-            local mx = gui.MousePos()
-            local diffX = mx - (self.PressX or mx)
-            self.PressX = mx
-            ent:SetAngles(Angle(0, ent:GetAngles().y + diffX * 0.5, 0))
-            lastDragTime = CurTime()
-        elseif CurTime() - lastDragTime > 2 then
-            ent:SetAngles(Angle(0, ent:GetAngles().y + FrameTime() * 15, 0))
-        end
-    end
+    local modelPreviewHint = vgui.Create("DLabel", previewPanel)
+    modelPreviewHint:SetPos(5, 27)
+    modelPreviewHint:SetSize(previewPanel:GetWide() - 10, 16)
+    modelPreviewHint:SetFont("RE4M_Tiny")
+    modelPreviewHint:SetTextColor(Color(210, 210, 210, 170))
+    modelPreviewHint:SetText("DRAG TO ROTATE  •  WHEEL TO ZOOM")
+    modelPreviewHint:SetContentAlignment(8)
 
     -- Info labels
     local nameLabel = vgui.Create("DLabel", previewPanel)
@@ -850,96 +1414,71 @@ function RE4M_CreatePlayermodelPanel(parent)
             ApplyPlayerColorToPreview()
         end
 
-        -- ===== TFA-VOX VOICE PACK (clickable list) =====
-        local voiceSets = nil
-        if TFA_VOX and TFA_VOX.VoiceSets then
-            voiceSets = TFA_VOX.VoiceSets
-        elseif istable(TFA) and TFA.VOX and TFA.VOX.VoiceSets then
-            voiceSets = TFA.VOX.VoiceSets
-        end
-
-        if voiceSets then
-            local voxHeaderPanel = vgui.Create("DPanel", controlsScroll)
-            voxHeaderPanel:SetSize(ctrlWidth, 20)
-            voxHeaderPanel:Dock(TOP)
-            voxHeaderPanel:DockMargin(0, 10, 0, 0)
-            voxHeaderPanel.Paint = function(self, w, h)
-                draw.SimpleText("TFA-VOX VOICE PACK", "RE4M_Tiny", 5, 2,
+        -- ===== TFA-VOX MODEL/PACK ASSIGNMENT =====
+        -- TFA-VOX registers packs by full model path. The gamemode bridge
+        -- assigns a registered pack table to the selected model on the server.
+        if istable(TFAVOX_Models) then
+            local voxHeader = vgui.Create("DPanel", controlsScroll)
+            voxHeader:SetSize(ctrlWidth, 20)
+            voxHeader:Dock(TOP)
+            voxHeader:DockMargin(0, 10, 0, 0)
+            voxHeader.Paint = function(self, w, h)
+                draw.SimpleText("TFA-VOX PACK FOR THIS MODEL", "RE4M_Tiny", 5, 2,
                     Color(255, 200, 200, 200), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
             end
 
-            -- Build sorted list of voice set names
-            local voxNames = {"Default"}
-            for name, _ in SortedPairs(voiceSets) do
-                table.insert(voxNames, name)
+            local packChoices = {}
+            for packModel in pairs(TFAVOX_Models) do
+                if isstring(packModel) and string.StartWith(string.lower(packModel), "models/") then
+                    packChoices[#packChoices + 1] = packModel
+                end
+            end
+            table.sort(packChoices)
+
+            local voxPicker = vgui.Create("DComboBox", controlsScroll)
+            voxPicker:SetSize(ctrlWidth, 28)
+            voxPicker:Dock(TOP)
+            voxPicker:DockMargin(0, 2, 0, 0)
+            voxPicker:SetValue("Select an installed TFA-VOX pack")
+            voxPicker.OnSelect = function(_, _, _, packModel)
+                state.voxPackPath = packModel
             end
 
-            -- Determine current selection
-            local currentVox = GetConVar("tfa_vox_voice") and GetConVar("tfa_vox_voice"):GetString() or "Default"
-            local selectedVox = currentVox
-
-            -- Calculate height: each row is 28px, cap at 6 visible rows
-            local visibleRows = math.min(#voxNames, 6)
-            local listHeight = visibleRows * 28
-
-            local voxScrollPanel = vgui.Create("DScrollPanel", controlsScroll)
-            voxScrollPanel:SetSize(ctrlWidth, listHeight)
-            voxScrollPanel:Dock(TOP)
-            voxScrollPanel:DockMargin(0, 2, 0, 0)
-
-            do
-                local vsbar = voxScrollPanel:GetVBar()
-                vsbar:SetWide(6)
-                vsbar.Paint         = function(s, w, h) draw.RoundedBox(3, 0, 0, w, h, Color(30, 15, 15, 200)) end
-                vsbar.btnGrip.Paint = function(s, w, h) draw.RoundedBox(3, 0, 0, w, h, Color(180, 60, 60, 200)) end
-                vsbar.btnUp.Paint   = function() end
-                vsbar.btnDown.Paint = function() end
+            for _, packModel in ipairs(packChoices) do
+                local label = string.StripExtension(string.GetFileFromFilename(packModel))
+                voxPicker:AddChoice(label, packModel)
             end
 
-            local voxButtons = {}
+            local assignVox = vgui.Create("DButton", controlsScroll)
+            assignVox:SetSize(ctrlWidth, 28)
+            assignVox:Dock(TOP)
+            assignVox:DockMargin(0, 3, 0, 0)
+            assignVox:SetText("Assign pack to selected model")
+            assignVox:SetEnabled(LocalPlayer():RE4M_IsAdmin() and #packChoices > 0)
+            assignVox.DoClick = function()
+                local packModel = state.voxPackPath
+                if not packModel or state.modelPath == "" then return end
 
-            for _, voxName in ipairs(voxNames) do
-                local voxBtn = vgui.Create("DButton", voxScrollPanel)
-                voxBtn:SetSize(ctrlWidth - 8, 26)
-                voxBtn:Dock(TOP)
-                voxBtn:DockMargin(2, 1, 2, 1)
-                voxBtn:SetText(voxName)
-                voxBtn:SetFont("RE4M_Tiny")
-                voxBtn:SetTextColor(Color(255, 255, 255))
+                net.Start("RE4M_AssignTFA_VOX")
+                    net.WriteString(state.modelPath)
+                    net.WriteString(packModel)
+                net.SendToServer()
+                state.voxPackPath = packModel
+                surface.PlaySound("ui/btn_click.wav")
+            end
 
-                voxBtn.VoxName = voxName
-                table.insert(voxButtons, voxBtn)
-
-                voxBtn.Paint = function(self, w, h)
-                    local isSelected = (selectedVox == self.VoxName)
-                        or (self.VoxName == "Default" and (selectedVox == "" or selectedVox == "default"))
-                    local bg
-
-                    if isSelected then
-                        bg = Color(180, 40, 40, 220)
-                    elseif self:IsHovered() then
-                        bg = Color(100, 40, 40, 180)
-                    else
-                        bg = Color(40, 20, 20, 160)
-                    end
-
-                    draw.RoundedBox(4, 0, 0, w, h, bg)
-
-                    if isSelected then
-                        surface.SetDrawColor(255, 60, 60, 120)
-                        surface.DrawOutlinedRect(0, 0, w, h, 1)
-                    end
-                end
-
-                voxBtn.DoClick = function(self)
-                    selectedVox = self.VoxName
-                    if self.VoxName == "Default" then
-                        RunConsoleCommand("tfa_vox_voice", "")
-                    else
-                        RunConsoleCommand("tfa_vox_voice", self.VoxName)
-                    end
-                    surface.PlaySound("ui/btn_click.wav")
-                end
+            if #packChoices == 0 then
+                local noPacks = vgui.Create("DLabel", controlsScroll)
+                noPacks:SetSize(ctrlWidth, 20)
+                noPacks:Dock(TOP)
+                noPacks:SetText("No TFA-VOX packs are registered.")
+                noPacks:SetTextColor(Color(200, 200, 200, 160))
+            elseif not LocalPlayer():RE4M_IsAdmin() then
+                local adminNote = vgui.Create("DLabel", controlsScroll)
+                adminNote:SetSize(ctrlWidth, 20)
+                adminNote:Dock(TOP)
+                adminNote:SetText("An admin can assign a voice pack to this model.")
+                adminNote:SetTextColor(Color(200, 200, 200, 160))
             end
         end
 
@@ -1007,25 +1546,20 @@ function RE4M_CreatePlayermodelPanel(parent)
             local ent = mdlPanel.Entity
             if not IsValid(ent) then return end
 
-            local mn, mx = ent:GetRenderBounds()
-            if mn and mx then
-                local center = (mn + mx) * 0.5
-                local height = math.max(mx.z - mn.z, 10)
-                local dist   = height * 0.85
-                mdlPanel:SetCamPos(Vector(dist, 0, center.z))
-                mdlPanel:SetLookAt(Vector(0, 0, center.z))
-            end
+            FitPreviewCamera(mdlPanel, ent, 1.25)
 
-            local idleSeqs = {
-                "idle_all_01", "idle01", "idle_subtle",
-                "idle_relaxed", "idle_angry", "menu_gman",
-                "idle", "reference",
-            }
-            for _, seqName in ipairs(idleSeqs) do
-                local seq = ent:LookupSequence(seqName)
-                if seq and seq > 0 then
-                    ent:ResetSequence(seq)
-                    break
+            local menuIdle = ent:LookupSequence("menu_idle")
+            if menuIdle and menuIdle >= 0 then
+                ent:ResetSequence(menuIdle)
+                ent:SetCycle(0)
+                ent:SetPlaybackRate(1)
+            else
+                for _, sequenceName in ipairs({ "idle_all_01", "idle01", "idle_subtle", "idle" }) do
+                    local sequence = ent:LookupSequence(sequenceName)
+                    if sequence and sequence >= 0 then
+                        ent:ResetSequence(sequence)
+                        break
+                    end
                 end
             end
 
@@ -1220,6 +1754,12 @@ function RE4M_CreateThemePanel(parent)
             name = "RESIDENT EVIL 4 ENEMIES",
             desc = "Ganados galore!. \n The classic RE4 experience",
             color = Color(180, 40, 40),
+        },
+        {
+            id = "re5",
+            name = "RESIDENT EVIL 5 ENEMIES",
+            desc = "Manji have arrived!, The classic RE5 experience.\nNo additional addons required.",
+            color = Color(255, 20, 50),
         },
         {
             id = "halflife",

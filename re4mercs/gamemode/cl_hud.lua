@@ -85,6 +85,10 @@ hook.Add("HUDPaint", "RE4M_HUD", function()
         RE4M_DrawPreRoundHUD()
     end
 
+    if state == GAMESTATE_ACTIVE then
+        RE4M_DrawProgressionHUD()
+    end
+
     -- Always draw these overlays
     RE4M_DrawKillFeed()
     RE4M_DrawPopups()
@@ -99,10 +103,19 @@ end)
 -- PRE-ROUND COUNTDOWN
 -- ============================================
 
+local lastPreRoundCount
+
 function RE4M_DrawPreRoundHUD()
     local endTime   = GetGlobalFloat("RE4M_PreRoundEnd", 0)
     local remaining = math.max(0, endTime - CurTime())
     local countDown = math.ceil(remaining)
+
+    if countDown > 0 and countDown ~= lastPreRoundCount then
+        lastPreRoundCount = countDown
+        RE4M_PlayUISound("ui/countdown.ogg")
+    elseif countDown <= 0 then
+        lastPreRoundCount = nil
+    end
 
     local sw, sh = ScrW(), ScrH()
 
@@ -124,6 +137,7 @@ function RE4M_DrawPreRoundHUD()
 
     local themeNames = {
         default  = "RESIDENT EVIL 4 ENEMIES",
+        re5  = "RESIDENT EVIL 5 ENEMIES",
         halflife = "HALF-LIFE 2 ENEMIES",
         custom   = "CUSTOM ENEMIES",
     }
@@ -393,6 +407,35 @@ function RE4M_DrawActiveHUD()
         90, 40,
         hudColors.text,
         TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+
+end
+
+-- Read the authoritative replicated player fields directly so the HUD does
+-- not depend on whether the lobby profile snapshot has finished syncing.
+function RE4M_DrawProgressionHUD()
+    local ply = LocalPlayer()
+    if not IsValid(ply) then return end
+
+    local playerLevel = ply:GetNWInt("RE4M_PlayerLevel", 1)
+    local weaponLevel = ply:GetNWInt("RE4M_ActiveWeaponLevel", 1)
+    local mercPoints = ply:GetNWInt("RE4M_MercPoints", 0)
+    DrawPanelBox(10, 65, 300, 86, Color(0, 0, 0, 200), Color(150, 70, 190, 200))
+    draw.SimpleText("PLAYER Lv." .. playerLevel .. "   WEAPON Lv." .. weaponLevel .. "   MP " .. mercPoints,
+        "RE4M_Tiny", 20, 73, Color(245, 225, 255), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+
+    local visible = 0
+    for slot = 1, 3 do
+        local skillID = ply:GetNWString("RE4M_EquippedSkill" .. slot, "")
+        if skillID == "" then continue end
+        visible = visible + 1
+        local skill = RE4M_SKILLS_BY_ID and RE4M_SKILLS_BY_ID[skillID]
+        draw.SimpleText(visible .. ". " .. (skill and skill.name or skillID), "RE4M_Tiny",
+            20, 95 + (visible - 1) * 15, Color(215, 175, 255), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+    end
+    if visible == 0 then
+        draw.SimpleText("SKILLS: none equipped", "RE4M_Tiny", 20, 99,
+            Color(190, 180, 195), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+    end
 end
 
 -- Track combo timing clientside
@@ -588,25 +631,73 @@ end
 -- FLOATING HEALTH BARS ABOVE ENEMIES
 -- ============================================
 
+local healthBarEntities = {}
+local healthBarEnabledCVar = GetConVar("re4m_showenemyhealthbars")
+local healthBarDistanceCVar = GetConVar("re4m_healthbarmaxdistance")
+
+local function TrackHealthBarEntity(ent)
+    if not IsValid(ent) then return end
+    if not (ent:IsNPC() or ent:IsNextBot()) then return end
+
+    local attempts = 0
+    local function tryTrack()
+        if not IsValid(ent) then return end
+        if ent:GetNWBool("RE4M_Spawned", false) then
+            healthBarEntities[ent] = true
+            return
+        end
+
+        -- Give the initial networked marker a short window to arrive. This
+        -- runs only for NPCs/NextBots, never for ordinary map entities.
+        attempts = attempts + 1
+        if attempts < 6 then timer.Simple(0.2, tryTrack) end
+    end
+    timer.Simple(0.2, tryTrack)
+end
+
+-- NetworkEntityCreated fires only for entities replicated to this client.
+-- Cache spawned NPCs as they enter PVS instead of walking every entity every
+-- HUD frame; a one-time seed covers entities already present at load.
+hook.Add("NetworkEntityCreated", "RE4M_TrackHealthBarEntities", TrackHealthBarEntity)
+hook.Add("EntityRemoved", "RE4M_UntrackHealthBarEntities", function(ent)
+    healthBarEntities[ent] = nil
+end)
+timer.Simple(0, function()
+    for _, ent in ipairs(ents.GetAll()) do
+        TrackHealthBarEntity(ent)
+    end
+end)
+
 hook.Add("HUDPaint", "RE4M_EnemyHealthBars", function()
     if RE4M_CLIENT.GameState ~= GAMESTATE_ACTIVE then return end
+    healthBarEnabledCVar = healthBarEnabledCVar or GetConVar("re4m_showenemyhealthbars")
+    if healthBarEnabledCVar and not healthBarEnabledCVar:GetBool() then return end
 
     local ply = LocalPlayer()
     if not IsValid(ply) then return end
 
     local eyePos     = ply:EyePos()
-    local maxDrawDist = 1500
+    healthBarDistanceCVar = healthBarDistanceCVar or GetConVar("re4m_healthbarmaxdistance")
+    local maxDrawDist = healthBarDistanceCVar and math.max(healthBarDistanceCVar:GetFloat(), 1) or 2000
+    local maxDrawDistSqr = maxDrawDist * maxDrawDist
 
-    for _, ent in ipairs(ents.GetAll()) do
+    for ent in pairs(healthBarEntities) do
+        if not IsValid(ent) then
+            healthBarEntities[ent] = nil
+            continue
+        end
         if not (ent:IsNPC() or ent:IsNextBot()) then continue end
-        if not ent.RE4M_Spawned then continue end
+        if not ent:GetNWBool("RE4M_Spawned", false) then
+            healthBarEntities[ent] = nil
+            continue
+        end
         local healthFrac = ent:GetNWFloat("RE4M_HealthFrac", -1)
         if healthFrac < 0 or healthFrac <= 0 then continue end
-        if healthFrac <= 0 then continue end -- dead
 
         local entPos = ent:GetPos()
-        local dist   = eyePos:Distance(entPos)
-        if dist > maxDrawDist then continue end
+        local distSqr = eyePos:DistToSqr(entPos)
+        if distSqr > maxDrawDistSqr then continue end
+        local dist = math.sqrt(distSqr)
 
         -- Position bar above the model bounding box
         local obbMaxZ = ent:OBBMaxs().z
@@ -620,54 +711,40 @@ hook.Add("HUDPaint", "RE4M_EnemyHealthBars", function()
 
         -- Scale with distance
         local scaleFactor = math.Clamp(1 - (dist / maxDrawDist), 0.3, 1.0)
-        local barWidth    = 60 * scaleFactor
-        local barHeight   = 6  * scaleFactor
+        local barWidth    = 220 * scaleFactor
+        local barHeight   = 9   * scaleFactor
 
         -- Fade with distance
         local distAlpha = math.Clamp(255 * (1 - (dist / maxDrawDist) * 0.5), 80, 255)
 
         local isElite = ent:GetNWBool("RE4M_IsElite", false)
 
-        -- Background outline
-        draw.RoundedBox(2,
-            sx - barWidth / 2 - 1, sy - 1,
-            barWidth + 2, barHeight + 2,
-            Color(0, 0, 0, distAlpha * 0.8))
+        local barLeft = sx - barWidth / 2
+        local barTop = sy
+        local border = math.max(1, math.floor(scaleFactor * 1.5))
+        local fillWidth = math.max(0, (barWidth - border * 2) * healthFrac)
 
-        -- Health fill color
-        local fillColor
-        if isElite then
-            local pulse = PulseValue(3, 0.7, 1.0)
-            fillColor = Color(255 * pulse, 100 * pulse, 0, distAlpha)
-        else
-            if healthFrac > 0.6 then
-                fillColor = Color(50, 220, 50, distAlpha)
-            elseif healthFrac > 0.3 then
-                fillColor = Color(255, 200, 0, distAlpha)
-            else
-                fillColor = Color(255, 50, 50, distAlpha)
-            end
+        -- Thin neon-violet bar with a hot-pink outline, like the reference.
+        surface.SetDrawColor(255, 75, 245, distAlpha)
+        surface.DrawRect(barLeft, barTop, barWidth, barHeight)
+        surface.SetDrawColor(34, 10, 45, distAlpha)
+        surface.DrawRect(barLeft + border, barTop + border,
+            math.max(0, barWidth - border * 2), math.max(0, barHeight - border * 2))
+        surface.SetDrawColor(193, 42, 255, distAlpha)
+        surface.DrawRect(barLeft + border, barTop + border, fillWidth,
+            math.max(0, barHeight - border * 2))
+        if fillWidth > 0 then
+            surface.SetDrawColor(255, 166, 255, distAlpha * 0.85)
+            surface.DrawRect(barLeft + border, barTop + border,
+                fillWidth, math.max(1, math.floor(border * 0.65)))
         end
 
-        local fillWidth = math.max(0, barWidth * healthFrac)
-        draw.RoundedBox(2, sx - barWidth / 2, sy, fillWidth, barHeight, fillColor)
-
-        -- Elite label
-        if isElite then
-            draw.SimpleText("ELITE", "RE4M_HealthBar",
-                sx, sy - 12,
-                Color(255, 80, 80, distAlpha),
-                TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
-        end
-
-        -- Percentage for nearby enemies
-        if dist < 800 then
-            local pctText = math.floor(healthFrac * 100) .. "%"
-            draw.SimpleText(pctText, "RE4M_HealthBar",
-                sx, sy + barHeight + 4,
-                Color(255, 255, 255, distAlpha * 0.7),
-                TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP)
-        end
+        local enemyLevel = ent:GetNWInt("RE4M_EnemyLevel", isElite and 2 or 1)
+        local enemyHealth = math.max(ent:Health(), 0)
+        local enemyMaxHealth = math.max(ent:GetNWInt("RE4M_EnemyMaxHealth", ent:GetMaxHealth()), 1)
+        draw.SimpleText("Lv. " .. enemyLevel .. "  •  HP " .. enemyHealth .. " / " .. enemyMaxHealth, "RE4M_EnemyLevel",
+            barLeft, barTop + barHeight + 1,
+            Color(255, 198, 95, distAlpha), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
     end
 end)
 

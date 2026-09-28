@@ -5,6 +5,7 @@ include("cl_hud.lua")
 include("cl_menu.lua")
 include("cl_music.lua")
 include("cl_results.lua")
+include("cl_camera_movement.lua")
 
 -- ============================================
 -- CLIENT STATE
@@ -34,7 +35,8 @@ RE4M_CLIENT = {
     DamageNumbers    = {},
     KillScoreFloats  = {},
     EliteAlerts      = {},
-    EchoTeam = {
+    ProgressionProfiles = {},
+    EchoTeam         = {
         msg1 = "",
         msg2 = "",
         msg3 = "",
@@ -42,6 +44,14 @@ RE4M_CLIENT = {
         startTime = 0,
     },
 }
+
+function RE4M_PlayUISound(path, fallback)
+    if file.Exists("sound/" .. path, "GAME") then
+        surface.PlaySound(path)
+    elseif fallback and file.Exists("sound/" .. fallback, "GAME") then
+        surface.PlaySound(fallback)
+    end
+end
 
 -- ============================================
 -- FONTS
@@ -177,6 +187,14 @@ local function CreateFonts()
         antialias = true,
     })
 
+    surface.CreateFont("RE4M_EnemyLevel", {
+        font = "Arial Black",
+        size = 20,
+        weight = 900,
+        antialias = true,
+        outline = true,
+    })
+
     surface.CreateFont("RE4M_EliteAlert", {
         font = "Arial Black",
         size = 44,
@@ -213,6 +231,7 @@ net.Receive("RE4M_GameState", function()
         RE4M_CloseResults()
         RE4M_CloseMainMenu()
         RE4M_StopMenuMusic()
+        RE4M_PlayUISound("ui/ui_startmatch.wav")
 
     elseif state == GAMESTATE_ACTIVE then
         RE4M_CloseMainMenu()
@@ -380,6 +399,7 @@ net.Receive("RE4M_AllScores", function()
 end)
 
 net.Receive("RE4M_EchoTeamMessage", function()
+    RE4M_CLIENT.EchoTeam = RE4M_CLIENT.EchoTeam or {}
     RE4M_CLIENT.EchoTeam.msg1     = net.ReadString()
     RE4M_CLIENT.EchoTeam.msg2     = net.ReadString()
     RE4M_CLIENT.EchoTeam.msg3     = net.ReadString()
@@ -515,5 +535,287 @@ hook.Add("Think", "RE4M_ClientThink", function()
     end
     if ply.RE4M_GetKills then
         RE4M_CLIENT.Kills = ply:RE4M_GetKills()
+    end
+end)
+
+
+-- =============================================
+-- Parry System
+-- =============================================
+
+local nextAttempt = 0
+local parryKnife = nil
+local KNIFE_MODEL = "models/weapons/w_knife_t.mdl"
+local originalTPIK = nil          -- stores original arc9_tpik value
+
+concommand.Add("re4m_parry", function()
+    if RE4M_CLIENT.GameState ~= GAMESTATE_ACTIVE then return end
+    if nextAttempt > CurTime() then return end
+
+    local cfg = RE4MERCS_GetConfig and RE4MERCS_GetConfig()
+    if cfg and cfg.ParryEnabled == false then return end
+
+    nextAttempt = CurTime() + 0.25
+    net.Start("RE4M_ParryRequest")
+    net.SendToServer()
+end)
+
+net.Receive("RE4M_ParryHit", function()
+    local pos = net.ReadVector()
+
+    local effectdata = EffectData()
+    effectdata:SetOrigin(pos)
+    effectdata:SetNormal(Vector(0, 0, 1))
+    effectdata:SetMagnitude(2)
+    effectdata:SetScale(1.5)
+    effectdata:SetRadius(3)
+    util.Effect("Sparks", effectdata)
+
+    local flash = EffectData()
+    flash:SetOrigin(pos)
+    flash:SetScale(1.2)
+    util.Effect("cball_explode", flash)
+end)
+
+net.Receive("RE4M_PlayParryAnim", function()
+    local ply = LocalPlayer()
+    if not IsValid(ply) then return end
+
+    ply:AnimRestartMainSequence()
+
+    -- Force ARC9 third-person IK off so arms don't bug
+    local tpikCvar = GetConVar("arc9_tpik")
+    if tpikCvar then
+        originalTPIK = tpikCvar:GetInt()
+        RunConsoleCommand("arc9_tpik", "0")
+    end
+
+    -- Create the temporary knife model
+    if IsValid(parryKnife) then
+        parryKnife:Remove()
+    end
+
+    parryKnife = ClientsideModel(KNIFE_MODEL)
+    if not IsValid(parryKnife) then return end
+
+    parryKnife:SetNoDraw(false)
+    parryKnife:SetOwner(ply)
+
+    local bone = ply:LookupBone("ValveBiped.Bip01_R_Hand") or 0
+
+    -- Keep knife positioned + hide the real gun
+    hook.Add("Think", "RE4M_ParryKnifeThink", function()
+        if not IsValid(ply) then
+            hook.Remove("Think", "RE4M_ParryKnifeThink")
+            if IsValid(parryKnife) then parryKnife:Remove() end
+            return
+        end
+
+        local parryEnd = ply:GetNW2Float("RE4M_ParryTime", 0)
+        if parryEnd <= CurTime() then
+            -- Parry finished – clean up
+            hook.Remove("Think", "RE4M_ParryKnifeThink")
+
+            if IsValid(parryKnife) then
+                parryKnife:Remove()
+                parryKnife = nil
+            end
+
+            -- Restore original weapon visibility
+            local wep = ply:GetActiveWeapon()
+            if IsValid(wep) then
+                wep:SetNoDraw(false)
+            end
+
+            -- Restore ARC9 TPIK
+            if originalTPIK ~= nil then
+                RunConsoleCommand("arc9_tpik", tostring(originalTPIK))
+                originalTPIK = nil
+            end
+            return
+        end
+
+        -- Hide the real gun so only the knife is visible
+        local wep = ply:GetActiveWeapon()
+        if IsValid(wep) then
+            wep:SetNoDraw(true)
+        end
+
+        -- Position the knife in the hand
+        if IsValid(parryKnife) and bone then
+            local matrix = ply:GetBoneMatrix(bone)
+            if matrix then
+                local pos = matrix:GetTranslation()
+                local ang = matrix:GetAngles()
+
+                -- Adjust these if the knife sits wrong
+                pos = pos + ang:Forward() * 3 + ang:Right() * 1.5 + ang:Up() * -1
+                ang:RotateAroundAxis(ang:Right(), 90)
+                ang:RotateAroundAxis(ang:Up(), 180)
+
+                parryKnife:SetPos(pos)
+                parryKnife:SetAngles(ang)
+            end
+        end
+    end)
+end)
+
+-- ============================================
+-- Movement lock
+-- ============================================
+hook.Add("SetupMove", "RE4M_ParryLockMovement", function(ply, mv, cmd)
+    local parryEnd = ply:GetNW2Float("RE4M_ParryTime", 0)
+    if parryEnd > CurTime() then
+        mv:SetForwardSpeed(0)
+        mv:SetSideSpeed(0)
+        mv:SetUpSpeed(0)
+        mv:SetMaxClientSpeed(0)
+    end
+end)
+
+-- ============================================
+-- Forced third person during parry
+-- ============================================
+hook.Add("CalcView", "RE4M_ParryThirdPerson", function(ply, pos, angles, fov)
+    if not IsValid(ply) or ply ~= LocalPlayer() then return end
+
+    local parryEnd = ply:GetNW2Float("RE4M_ParryTime", 0)
+    if parryEnd <= CurTime() then return end
+
+    local view = {}
+    view.origin = pos - angles:Forward() * 70 + angles:Up() * 12
+    view.angles = angles
+    view.fov    = fov
+
+    local tr = util.TraceLine({
+        start  = pos,
+        endpos = view.origin,
+        filter = ply,
+        mask   = MASK_SOLID_BRUSHONLY,
+    })
+    if tr.Hit then
+        view.origin = tr.HitPos + tr.HitNormal * 2
+    end
+
+    return view
+end)
+
+-- Hide first-person viewmodel
+hook.Add("PreDrawViewModel", "RE4M_ParryHideViewmodel", function(vm, ply, wep)
+    local parryEnd = ply:GetNW2Float("RE4M_ParryTime", 0)
+    if parryEnd > CurTime() then
+        return true
+    end
+end)
+
+-- Draw the local player model in third person
+hook.Add("ShouldDrawLocalPlayer", "RE4M_ParryShowThirdPersonModel", function(ply)
+    local parryEnd = ply:GetNW2Float("RE4M_ParryTime", 0)
+    return parryEnd > CurTime()
+end)
+
+-- ============================================
+-- Simple QTE prompt
+-- ============================================
+hook.Add("HUDPaint", "RE4M_ParryQTE", function()
+    if RE4M_CLIENT.GameState ~= GAMESTATE_ACTIVE then return end
+
+    local ply = LocalPlayer()
+    if not IsValid(ply) or not ply:Alive() then return end
+
+    -- Don't show the prompt while already parrying
+    if ply:GetNW2Float("RE4M_ParryTime", 0) > CurTime() then return end
+
+    local cfg = RE4MERCS_GetConfig and RE4MERCS_GetConfig()
+    if not cfg or cfg.ParryEnabled == false then return end
+
+    local range = cfg.ParryRange or 120
+    local showPrompt = false
+
+    for _, ent in ipairs(ents.FindInSphere(ply:GetPos(), range)) do
+        if not IsValid(ent) then continue end
+        if not (ent.IsDrGNextbot or ent:IsNextBot()) then continue end
+        if not ent.Parryable then continue end
+
+        local attacking = false
+        if ent.IsAttacking and isfunction(ent.IsAttacking) and ent:IsAttacking() then
+            attacking = true
+        else
+            local seqName = string.lower(ent:GetSequenceName(ent:GetSequence()) or "")
+            if string.find(seqName, "att") and not string.find(seqName, "grab") and not string.find(seqName, "idle") then
+                attacking = true
+            end
+        end
+
+        if attacking then
+            showPrompt = true
+            break
+        end
+    end
+
+    if not showPrompt then return end
+
+    local sw, sh = ScrW(), ScrH()
+    local alpha = 180 + math.sin(CurTime() * 8) * 75   -- gentle pulse
+
+    -- Background bar
+    surface.SetDrawColor(0, 0, 0, alpha * 0.6)
+    surface.DrawRect(sw / 2 - 140, sh * 0.72, 280, 42)
+
+    -- Text
+    draw.SimpleText("PARRY  [ G ]", "RE4M_Medium",
+        sw / 2, sh * 0.72 + 21,
+        Color(255, 220, 80, alpha),
+        TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+end)
+
+net.Receive("RE4M_LobbyProgression", function()
+    local len = net.ReadUInt(32)
+    if len == 0 or len > 65536 then return end
+
+    local compressed = net.ReadData(len)
+    if not compressed then return end
+    local json = util.Decompress(compressed)
+    if not json then return end
+
+    local profiles = util.JSONToTable(json)
+    if istable(profiles) then
+        local current = RE4M_CLIENT.ProgressionProfiles or {}
+        for steamID, newProfile in pairs(profiles) do
+            local oldProfile = current[steamID]
+            if istable(oldProfile) and istable(oldProfile.weapons) and
+               istable(newProfile) and istable(newProfile.weapons) then
+                for class, weaponData in pairs(oldProfile.weapons) do
+                    if newProfile.weapons[class] == nil then
+                        newProfile.weapons[class] = weaponData
+                    end
+                end
+            end
+        end
+        table.Empty(current)
+        table.Merge(current, profiles)
+        RE4M_CLIENT.ProgressionProfiles = current
+        RE4M_CLIENT.ProgressionRevision = (RE4M_CLIENT.ProgressionRevision or 0) + 1
+    end
+end)
+
+net.Receive("RE4M_AssignTFA_VOX", function()
+    local targetModel = net.ReadString()
+    local sourceModel = net.ReadString()
+    if not istable(TFAVOX_Models) or not isstring(targetModel) or not isstring(sourceModel) then return end
+
+    local pack = TFAVOX_Models[sourceModel]
+    if not istable(pack) then
+        local sourceLower = string.lower(sourceModel)
+        for registeredPath, registeredPack in pairs(TFAVOX_Models) do
+            if isstring(registeredPath) and string.lower(registeredPath) == sourceLower and istable(registeredPack) then
+                pack = registeredPack
+                break
+            end
+        end
+    end
+
+    if istable(pack) then
+        TFAVOX_Models[targetModel] = pack
     end
 end)

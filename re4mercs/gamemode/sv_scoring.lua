@@ -13,6 +13,24 @@ function RE4M_OnKill(ply, victim, dmgInfo)
     if IsValid(victim) then
         if victim.RE4M_KillCredited then return end
         victim.RE4M_KillCredited = true
+
+        local weaponClass
+        if victim.RE4M_LastDamageAttacker == ply then
+            weaponClass = victim.RE4M_LastWeaponClass
+        end
+
+        if not weaponClass and dmgInfo and dmgInfo.GetInflictor then
+            local inflictor = dmgInfo:GetInflictor()
+            if IsValid(inflictor) and inflictor:IsWeapon() then
+                weaponClass = inflictor:GetClass()
+            end
+        end
+
+        if not weaponClass then
+            local activeWeapon = ply:GetActiveWeapon()
+            if IsValid(activeWeapon) then weaponClass = activeWeapon:GetClass() end
+        end
+        if weaponClass then RE4M_RecordWeaponKill(ply, weaponClass) end
     end
 
     local cfg = RE4MERCS_GetConfig()
@@ -55,6 +73,9 @@ function RE4M_OnKill(ply, victim, dmgInfo)
     end
 
     local totalScore = math.floor((baseScore + bonus) * multiplier)
+    if combo > 50 and RE4M_PlayerHasSkill and RE4M_PlayerHasSkill(ply, "limit_breaker") then
+        totalScore = math.floor(totalScore * 1.10)
+    end
     local currentScore = ply:RE4M_GetScore()
     ply:SetNWInt("RE4M_Score", currentScore + totalScore)
 
@@ -76,6 +97,9 @@ function RE4M_OnKill(ply, victim, dmgInfo)
 
     if comboTimeExtends[combo] then
         local bonusTime = comboTimeExtends[combo]
+        if RE4M_PlayerHasSkill and RE4M_PlayerHasSkill(ply, "combo_bonus") then
+            bonusTime = math.floor(bonusTime * 1.25)
+        end
         RE4M_ExtendTime(bonusTime, ply)
         ply.RE4M_LastTimeAdded = timeExtend + bonusTime
 

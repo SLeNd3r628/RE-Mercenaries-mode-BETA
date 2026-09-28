@@ -50,11 +50,15 @@ function RE4M_ShowResults(data)
             score = LocalPlayer():RE4M_GetScore(),
             kills = LocalPlayer():RE4M_GetKills(),
             maxCombo = LocalPlayer():RE4M_GetMaxCombo(),
+            level = LocalPlayer():GetNWInt("RE4M_PlayerLevel", 1),
+            xpGained = 0,
+            mpGained = 0,
             rank = "C",
         }
     end
 
     local rankName, rankColor = RE4MERCS_GetRank(localResult.score)
+    local lastScoreSoundStep = -1
 
     ResultsFrame.Paint = function(self, w, h)
         local elapsed = CurTime() - resultsAnimStart
@@ -124,13 +128,9 @@ function RE4M_ShowResults(data)
             TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
 
         -- Rank reveal sound (play once)
-        if resultsAnimState < 1 and elapsed >= 1.2 then
+        if resultsAnimState < 1 and elapsed >= 1.0 then
             resultsAnimState = 1
-            surface.PlaySound("ui/rank_reveal.ogg")
-            -- Fallback
-            if not file.Exists("sound/ui/rank_reveal.ogg", "GAME") then
-                surface.PlaySound("buttons/button14.wav")
-            end
+            RE4M_PlayUISound("ui/ui_rank_result.wav", "ui/rank_reveal.ogg")
         end
 
         if elapsed < 2.0 then return end
@@ -145,9 +145,13 @@ function RE4M_ShowResults(data)
             Color(200, 200, 200, statsAlpha), TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
 
         -- Animated score counter
-        local displayScore = localResult.score
-        if elapsed < 4.0 then
-            displayScore = math.floor(Lerp((elapsed - 2.0) / 2.0, 0, localResult.score))
+        local scoreProgress = math.Clamp((elapsed - 2.0) / 2.0, 0, 1)
+        local displayScore = math.floor(Lerp(scoreProgress, 0, localResult.score))
+        local scoreSoundSteps = math.min(math.max(math.floor(localResult.score), 1), 50)
+        local scoreSoundStep = math.floor(scoreProgress * scoreSoundSteps)
+        if localResult.score > 0 and scoreSoundStep > lastScoreSoundStep then
+            lastScoreSoundStep = scoreSoundStep
+            RE4M_PlayUISound("ui/ui_scorecount.wav")
         end
 
         draw.SimpleText(RE4MERCS_FormatScore(displayScore), "RE4M_Title", w/2, statsY + 50,
@@ -170,12 +174,20 @@ function RE4M_ShowResults(data)
         draw.SimpleText(tostring(localResult.maxCombo), "RE4M_Large", col2X + 170, gridY,
             Color(255, 215, 0, statsAlpha), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
 
+        draw.SimpleText("PLAYER LEVEL  " .. tostring(localResult.level or 1) ..
+            "     PLAYER XP  +" .. tostring(localResult.xpGained or 0),
+            "RE4M_Small", w / 2, gridY + 48,
+            Color(210, 175, 255, statsAlpha), TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP)
+        draw.SimpleText("MERC POINTS  +" .. tostring(localResult.mpGained or 0),
+            "RE4M_Small", w / 2, gridY + 72,
+            Color(255, 220, 100, statsAlpha), TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP)
+
         if elapsed < 3.0 then return end
 
         -- ============ LEADERBOARD (Multiplayer) ============
         if #resultsData > 1 then
             local lbAlpha = math.Clamp((elapsed - 3.0) * 400, 0, 255)
-            local lbY = gridY + 80
+            local lbY = gridY + 105
 
             draw.SimpleText("LEADERBOARD", "RE4M_Medium", w/2, lbY,
                 Color(255, 60, 60, lbAlpha), TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
@@ -198,6 +210,9 @@ function RE4M_ShowResults(data)
                 -- Name
                 draw.SimpleText(result.name, "RE4M_Medium", w/2 - 180, entryY,
                     entryColor, TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+
+                draw.SimpleText("Lv." .. tostring(result.level or 1), "RE4M_Small",
+                    w/2 - 5, entryY + 3, entryColor, TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
 
                 -- Score
                 draw.SimpleText(RE4MERCS_FormatScore(result.score), "RE4M_Medium", w/2 + 100, entryY,

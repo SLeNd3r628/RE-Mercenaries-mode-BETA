@@ -1,7 +1,47 @@
 -- RE4 Mercenaries Remake - Round Management (Server)
 
+local function RE4M_AdminCleanupThen(callback)
+    local command = concommand.GetTable().gmod_admin_cleanup
+    if not command then
+        ErrorNoHalt("[RE4 Mercs] gmod_admin_cleanup is unavailable; cannot safely reset the round.\n")
+        return
+    end
+
+    local hookID = "RE4M_AdminCleanupBeforeMenuRespawn"
+    hook.Remove("PostCleanupMap", hookID)
+    hook.Add("PostCleanupMap", hookID, function()
+        hook.Remove("PostCleanupMap", hookID)
+        if callback then callback() end
+    end)
+
+    -- This is Garry's Mod's real Admin Cleanup console command. It performs
+    -- cleanup list removal and game.CleanUpMap with the engine's normal hooks.
+    game.ConsoleCommand("gmod_admin_cleanup\n")
+end
+
+local function RE4M_RespawnForMenu(ply)
+    if not IsValid(ply) then return end
+
+    -- Spawn alone can leave a dead player's previous observer/death camera
+    -- attached when the mode is restarted on the same map.
+    ply:Freeze(false)
+    ply:UnSpectate()
+    ply:SetObserverMode(OBS_MODE_NONE)
+    ply:Spawn()
+    ply:SetViewEntity(ply)
+    ply:Freeze(true)
+    ply:StripWeapons()
+end
+
 --- Start the pre-round countdown
 function RE4M_StartPreRound()
+    timer.Remove("RE4M_PreRound")
+    timer.Remove("RE4M_RoundTick")
+    timer.Remove("RE4M_ComboDecay")
+    timer.Remove("RE4M_PostRoundCleanup")
+    timer.Remove("RE4M_PostRoundResults")
+    timer.Remove("RE4M_ReturnToMenu")
+
     RE4M_SetGameState(GAMESTATE_PREROUND)
     local cfg = RE4MERCS_GetConfig()
     net.Start("RE4M_EchoTeamMessage")
@@ -23,7 +63,10 @@ function RE4M_StartPreRound()
 
         -- Spawn/respawn player
         if not ply:Alive() then
+            ply:UnSpectate()
+            ply:SetObserverMode(OBS_MODE_NONE)
             ply:Spawn()
+            ply:SetViewEntity(ply)
         end
 
         ply:Freeze(true)
@@ -46,11 +89,6 @@ function RE4M_StartPreRound()
 
     -- Broadcast countdown start
     SetGlobalFloat("RE4M_PreRoundEnd", CurTime() + preTime)
-
-    -- Play countdown sound
-    for _, ply in ipairs(player.GetAll()) do
-        ply:EmitSound("ui/countdown.ogg", 75, 100, 0.5)
-    end
 
     timer.Create("RE4M_PreRound", preTime, 1, function()
         RE4M_StartRound()
@@ -113,10 +151,13 @@ function RE4M_StartRound()
             return
         end
 
-        local comboTimeout = cfg.ComboTimeout or 8
-
         for _, ply in ipairs(player.GetAll()) do
             if ply:Alive() and ply:RE4M_GetCombo() > 0 then
+                local comboTimeout = cfg.ComboTimeout or 8
+                local roundRemaining = (RE4M_STATE.RoundEndTime or CurTime()) - CurTime()
+                if roundRemaining <= 30 and RE4M_PlayerHasSkill and RE4M_PlayerHasSkill(ply, "go_for_broke") then
+                    comboTimeout = comboTimeout + 2
+                end
                 local timeSinceKill = CurTime() - (ply.RE4M_LastKillTime or 0)
                 if timeSinceKill >= comboTimeout then
                     RE4M_ResetCombo(ply, "timeout")
@@ -186,13 +227,15 @@ function RE4M_EndRound()
     end
 
     -- Clean up NPCs (with slight delay for dramatic effect)
-    timer.Simple(2, function()
+    timer.Create("RE4M_PostRoundCleanup", 2, 1, function()
+        if RE4M_STATE.GameState ~= GAMESTATE_POSTROUND then return end
         RE4M_CleanupNPCs()
         RE4M_CleanupPickups()
     end)
 
     -- Build and send results
-    timer.Simple(3, function()
+    timer.Create("RE4M_PostRoundResults", 3, 1, function()
+        if RE4M_STATE.GameState ~= GAMESTATE_POSTROUND then return end
         RE4M_SendResults()
     end)
 
@@ -200,7 +243,8 @@ function RE4M_EndRound()
     local cfg = RE4MERCS_GetConfig()
     local postTime = cfg.PostRoundTime or 15
 
-    timer.Simple(postTime, function()
+    timer.Create("RE4M_ReturnToMenu", math.max(0, postTime), 1, function()
+        if RE4M_STATE.GameState ~= GAMESTATE_POSTROUND then return end
         RE4M_ReturnToMenu()
     end)
 end
@@ -212,16 +256,34 @@ function RE4M_SendResults()
     for _, ply in ipairs(player.GetAll()) do
         local score = ply:RE4M_GetScore()
         local rankName, rankColor = RE4MERCS_GetRank(score)
+        local xpGained = 0
+        local mpGained = 0
+
+        -- Each player's final score is converted to persistent player XP once
+        -- per round. This XP is shared across the player's full profile.
+        if ply.RE4M_ProgressionAwardedRound ~= RE4M_STATE.RoundNumber then
+            -- Award a small fraction of final score so persistent levels take
+            -- a long time to earn: 1 XP for each 100 score points.
+            xpGained, mpGained = RE4M_AwardPlayerXP(ply, math.floor(score / 100))
+            ply.RE4M_ProgressionAwardedRound = RE4M_STATE.RoundNumber
+        end
 
         table.insert(results, {
             name     = ply:Nick(),
             steamid  = ply:SteamID(),
             score    = score,
+            xpGained = xpGained,
+            mpGained = mpGained,
+            level    = ply:GetNWInt("RE4M_PlayerLevel", 1),
+            xp       = ply:GetNWInt("RE4M_PlayerXP", 0),
             kills    = ply:RE4M_GetKills(),
             maxCombo = ply:RE4M_GetMaxCombo(),
             rank     = rankName,
         })
     end
+
+    RE4M_SaveProgression()
+    RE4M_SendLobbyProgression()
 
     -- Sort by score descending
     table.sort(results, function(a, b) return a.score > b.score end)
@@ -239,23 +301,27 @@ end
 
 --- Return to the menu state
 function RE4M_ReturnToMenu()
-    RE4M_SetGameState(GAMESTATE_MENU)
-
-    -- Respawn and freeze all players
     for _, ply in ipairs(player.GetAll()) do
         if IsValid(ply) then
-            ply:Spawn()
-            ply:Freeze(true)
-            ply:StripWeapons()
-
-            -- Force menu open
-            net.Start("RE4M_ForceMenu")
-            net.Send(ply)
+            ply.RE4M_Ready = false
+            ply:SetNWBool("RE4M_Ready", false)
         end
     end
-end
 
--- NOTE: RE4M_CleanupNPCs() and RE4M_CleanupPickups() used to be redefined
--- here, silently overwriting the more thorough versions in sv_spawning.lua
--- (which also purge leftover ragdolls). They are now defined ONLY in
--- sv_spawning.lua - this file just calls them.
+    RE4M_SetGameState(GAMESTATE_MENU)
+
+    -- Run the actual Garry's Mod Admin Cleanup before resetting players. Its
+    -- PostCleanupMap hook marks completion, so respawns happen after entities
+    -- and the previous round's ragdolls/camera state have been cleared.
+    RE4M_AdminCleanupThen(function()
+        for _, ply in ipairs(player.GetAll()) do
+            if IsValid(ply) then
+                RE4M_RespawnForMenu(ply)
+
+                -- Force menu open
+                net.Start("RE4M_ForceMenu")
+                net.Send(ply)
+            end
+        end
+    end)
+end

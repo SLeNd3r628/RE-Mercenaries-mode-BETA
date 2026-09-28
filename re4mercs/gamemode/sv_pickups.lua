@@ -195,6 +195,10 @@ function RE4M_TrySpawnPickup(victim)
     if victim.RE4M_IsElite then
         dropChance = math.min(dropChance * 2.5, 0.8)  -- Up to 80% for elites
     end
+    local dropOwner = victim.RE4M_LastDamageAttacker
+    if IsValid(dropOwner) and RE4M_PlayerHasSkill and RE4M_PlayerHasSkill(dropOwner, "item_drop") then
+        dropChance = math.min(dropChance * 1.5, 0.95)
+    end
 
     -- Roll for drop
     if math.random() > dropChance then return end
@@ -252,7 +256,24 @@ hook.Add("PlayerTouch", "RE4M_PickupTouch", function(ply, ent)
 
     if pickupType == "health" then
         local amount = cfg.HealthPickupAmount or 25
+        if RE4M_PlayerHasSkill and RE4M_PlayerHasSkill(ply, "pharmacist") then amount = math.floor(amount * 1.5) end
         ply:SetHealth(math.min(ply:Health() + amount, ply:GetMaxHealth()))
+        if RE4M_PlayerHasSkill and RE4M_PlayerHasSkill(ply, "medic") then
+            for _, teammate in ipairs(player.GetAll()) do
+                if teammate ~= ply and IsValid(teammate) and teammate:Alive() and
+                    teammate:GetPos():DistToSqr(ply:GetPos()) <= 700 * 700 then
+                    teammate:SetHealth(math.min(teammate:Health() + math.floor(amount * 0.5), teammate:GetMaxHealth()))
+                end
+            end
+        end
+        if RE4M_PlayerHasSkill and RE4M_PlayerHasSkill(ply, "first_responder") then
+            for _, teammate in ipairs(player.GetAll()) do
+                if teammate ~= ply and IsValid(teammate) and teammate:Alive() and
+                    teammate:GetPos():DistToSqr(ply:GetPos()) > 700 * 700 and teammate:GetPos():DistToSqr(ply:GetPos()) <= 2500 * 2500 then
+                    teammate:SetHealth(math.min(teammate:Health() + 20, teammate:GetMaxHealth()))
+                end
+            end
+        end
 
     elseif pickupType == "ammo" then
         local wep = ply:GetActiveWeapon()
@@ -261,12 +282,17 @@ hook.Add("PlayerTouch", "RE4M_PickupTouch", function(ply, ent)
             if ammoType and ammoType >= 0 then
                 local maxAmmo = game.GetAmmoMax(ammoType) or 100
                 local giveAmt = math.max(1, math.floor(maxAmmo * (cfg.AmmoPickupMultiplier or 0.25)))
-                ply:GiveAmmo(giveAmt, ammoType)
+                if RE4M_GiveAmmo then
+                    RE4M_GiveAmmo(ply, giveAmt, ammoType)
+                else
+                    ply:GiveAmmo(giveAmt, ammoType)
+                end
             end
         end
 
     elseif pickupType == "time" then
         local seconds = cfg.TimePickupAmount or 10
+        if RE4M_PlayerHasSkill and RE4M_PlayerHasSkill(ply, "time_bonus") then seconds = math.floor(seconds * 1.5) end
         RE4M_ExtendTime(seconds, ply) -- this already nets RE4M_TimeExtend to ply
     end
 

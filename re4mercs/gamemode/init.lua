@@ -7,13 +7,17 @@ AddCSLuaFile("cl_hud.lua")
 AddCSLuaFile("cl_menu.lua")
 AddCSLuaFile("cl_music.lua")
 AddCSLuaFile("cl_results.lua")
+AddCSLuaFile("cl_camera_movement.lua")
 
 include("shared.lua")
 include("sv_scoring.lua")
+include("sv_progression.lua")
 include("sv_spawning.lua")
 include("sv_rounds.lua")
 include("sv_pickups.lua")
 include("sv_admin.lua")
+include("sv_wos_anims.lua")
+include("sv_vox.lua")
 
 -- ============================================
 -- REGISTER NET MESSAGES
@@ -36,6 +40,7 @@ local soundFiles = {
     "sound/re4mercs/HeatOnBeat.ogg",
     "sound/re4mercs/RideonSea.ogg",
     "sound/re4mercs/ThePressureIsOn.ogg",
+    "sound/re4mercs/bgm001.ogg",
     "sound/ui/results.ogg",
     "sound/ui/menu.ogg",
     "sound/ui/combo_milestone.ogg",
@@ -47,6 +52,10 @@ local soundFiles = {
     "sound/ui/round_end.ogg",
     "sound/ui/countdown.ogg",
     "sound/ui/rank_reveal.ogg",
+    "sound/ui/ui_ready.wav",
+    "sound/ui/ui_startmatch.wav",
+    "sound/ui/ui_rank_result.wav",
+    "sound/ui/ui_scorecount.wav",
 }
 
 for _, f in ipairs(soundFiles) do
@@ -63,6 +72,7 @@ end
 
 local materialFiles = {
     "materials/vgui/re4mercs/background.png",
+    "materials/vgui/re4mercs/background_lobby.png",
     "materials/vgui/re4mercs/vignette.png",
     "materials/vgui/re4mercs/logo.png",
     "materials/vgui/re4mercs/slot_bg.png",
@@ -99,6 +109,62 @@ RE4M_STATE = {
     HasNavmesh   = false,
 }
 
+function RE4M_UpdateLobbyReadyState()
+    if RE4M_STATE.GameState ~= GAMESTATE_MENU and RE4M_STATE.GameState ~= GAMESTATE_WAITING then return end
+
+    local players = player.GetAll()
+    local playerCount, readyCount = 0, 0
+
+    for _, ply in ipairs(players) do
+        if IsValid(ply) then
+            playerCount = playerCount + 1
+            if ply.RE4M_Ready then readyCount = readyCount + 1 end
+        end
+    end
+
+    local required = playerCount <= 1 and 1 or math.min(playerCount, 3)
+    SetGlobalInt("RE4M_LobbyReadyCount", readyCount)
+    SetGlobalInt("RE4M_LobbyReadyRequired", required)
+
+    if readyCount < required then
+        SetGlobalFloat("RE4M_LobbyStartAt", 0)
+    elseif GetGlobalFloat("RE4M_LobbyStartAt", 0) <= 0 then
+        SetGlobalFloat("RE4M_LobbyStartAt", CurTime() + 10)
+    end
+end
+
+-- Presentation rig used by the Lobby's clientside bone-merge previews.
+local lobbyModelFiles = {
+    "models/player/menu/menu_poses_REMERCS.mdl",
+    "models/player/menu/menu_poses_REMERCS.vvd",
+    "models/player/menu/menu_poses_REMERCS.dx90.vtx",
+    "models/player/menu/menu_poses_REMERCS.dx80.vtx",
+    "models/player/menu/menu_poses_REMERCS.phy",
+}
+
+for _, f in ipairs(lobbyModelFiles) do
+    if file.Exists(f, "GAME") then
+        resource.AddFile(f)
+    elseif RE4MERCS_CONFIG and RE4MERCS_CONFIG.Debug then
+        print("[RE4 Mercs] Missing Lobby presentation model file: " .. f)
+    end
+end
+
+-- Start automatically when the lobby countdown expires. The server remains
+-- authoritative and rechecks the ready minimum before entering the round.
+timer.Create("RE4M_LobbyAutoStart", 0.25, 0, function()
+    if RE4M_STATE.GameState ~= GAMESTATE_MENU and RE4M_STATE.GameState ~= GAMESTATE_WAITING then return end
+
+    RE4M_UpdateLobbyReadyState()
+    local readyCount = GetGlobalInt("RE4M_LobbyReadyCount", 0)
+    local required = math.max(GetGlobalInt("RE4M_LobbyReadyRequired", 1), 1)
+    local startAt = GetGlobalFloat("RE4M_LobbyStartAt", 0)
+    if readyCount < required or startAt <= 0 or CurTime() < startAt then return end
+
+    SetGlobalFloat("RE4M_LobbyStartAt", 0)
+    RE4M_StartPreRound()
+end)
+
 --- Set the global game state and notify all clients.
 function RE4M_SetGameState(state)
     -- FIX #3: Validate that state is a number before writing it to a net
@@ -110,6 +176,12 @@ function RE4M_SetGameState(state)
 
     RE4M_STATE.GameState = state
     SetGlobalInt("RE4M_GameState", state)
+
+    -- The start timer begins only after the lobby's ready-player minimum is met.
+    if state == GAMESTATE_MENU then
+        SetGlobalFloat("RE4M_LobbyStartAt", 0)
+        RE4M_UpdateLobbyReadyState()
+    end
 
     net.Start("RE4M_GameState")
         net.WriteUInt(state, 4)
@@ -145,20 +217,27 @@ function RE4M_BuildWeaponList()
     end
 
     local allWeapons = weapons.GetList()
+    local rejected   = {}
 
     for _, wep in ipairs(allWeapons) do
         local className   = wep.ClassName  or ""
-        local printName   = wep.PrintName  or className
+        local printName   = wep.PrintName  or ""
         local base        = wep.Base       or ""
         local worldModel  = wep.WorldModel or ""
 
-        local allowed = RE4MERCS_IsWeaponAllowed(className, base)
+        -- Several bases (ARC9, TacRP, MWB) ship weapons with an empty
+        -- PrintName and rely on a localisation lookup instead. The old code
+        -- threw those away entirely; fall back to the class name so they
+        -- still appear in the menu.
+        if printName == "" then
+            printName = className
+        end
 
-        -- FIX #5: Original skipped weapons where printName == "". That is
-        -- fine, but className == "" should also be rejected because Give("")
-        -- would later cause an error.
-        if allowed and className ~= "" and printName ~= "" then
-            local category = RE4MERCS_CategorizeWeapon(className, printName)
+        local allowed = RE4MERCS_IsWeaponAllowed(className, base, wep)
+
+        -- className == "" is rejected because Give("") errors later.
+        if allowed and className ~= "" then
+            local category = RE4MERCS_CategorizeWeapon(className, printName, wep)
             table.insert(RE4M_WeaponCache, {
                 class    = className,
                 name     = printName,
@@ -166,6 +245,8 @@ function RE4M_BuildWeaponList()
                 model    = worldModel,
                 base     = base,
             })
+        elseif className ~= "" then
+            rejected[#rejected + 1] = className .. " (base: " .. (base ~= "" and base or "none") .. ")"
         end
     end
 
@@ -176,10 +257,74 @@ function RE4M_BuildWeaponList()
         return a.category < b.category
     end)
 
+    print("[RE4 Mercs] Built weapon list: " .. #RE4M_WeaponCache ..
+          " allowed, " .. #rejected .. " rejected (of " .. #allWeapons .. " registered SWEPs)")
+
     if RE4MERCS_CONFIG and RE4MERCS_CONFIG.Debug then
-        print("[RE4 Mercs] Built weapon list: " .. #RE4M_WeaponCache .. " weapons")
+        for idx = 1, math.min(#rejected, 60) do
+            print("[RE4 Mercs]   rejected: " .. rejected[idx])
+        end
+        if #rejected > 60 then
+            print("[RE4 Mercs]   ...and " .. (#rejected - 60) .. " more")
+        end
     end
 end
+
+-- ============================================
+-- WEAPON DIAGNOSTICS
+-- Run "re4m_weapons_diag" in the SERVER console (or as an admin) to see
+-- exactly which weapon packs the server has mounted and how many weapons
+-- from each one the gamemode is accepting.
+-- ============================================
+concommand.Add("re4m_weapons_diag", function(ply, cmd, args)
+    if IsValid(ply) and not ply:RE4M_IsAdmin() then return end
+
+    local function out(msg)
+        if IsValid(ply) then ply:PrintMessage(HUD_PRINTCONSOLE, msg) else print(msg) end
+    end
+
+    local groups = {
+        ["ARC9"]                 = "arc9_",
+        ["ARCCW"]                = "arccw_",
+        ["TacRP"]                = "tacrp_",
+        ["Modern Warfare (mg_)"] = "mg_",
+        ["Modern Warfare (mw_)"] = "mw_",
+        ["Modern Warfare (mwb_)"]= "mwb_",
+        ["ASTW2"]                = "astw2_",
+        ["TFA"]                  = "tfa_",
+        ["CW 2.0"]               = "cw_",
+        ["M9K"]                  = "m9k_",
+        ["FA:S 2"]               = "fas2_",
+        ["HL2 / other"]          = "weapon_",
+    }
+
+    local all = weapons.GetList()
+    out("[RE4 Mercs] ===== WEAPON DIAGNOSTICS =====")
+    out("[RE4 Mercs] Total registered SWEPs on server: " .. #all)
+
+    for label, prefix in pairs(groups) do
+        local total, passed = 0, 0
+        for _, wep in ipairs(all) do
+            local class = string.lower(wep.ClassName or "")
+            if string.sub(class, 1, #prefix) == prefix then
+                total = total + 1
+                if RE4MERCS_IsWeaponAllowed(wep.ClassName, wep.Base or "", wep) then
+                    passed = passed + 1
+                end
+            end
+        end
+
+        if total > 0 then
+            out(string.format("[RE4 Mercs] %-24s registered: %-4d selectable: %d",
+                label, total, passed))
+        else
+            out(string.format("[RE4 Mercs] %-24s NOT INSTALLED ON SERVER", label))
+        end
+    end
+
+    out("[RE4 Mercs] Currently in loadout menu: " .. #RE4M_WeaponCache)
+    out("[RE4 Mercs] ==============================")
+end)
 
 function RE4M_SendWeaponList(ply)
     -- FIX #6: Always validate the player before sending a net message.
@@ -263,17 +408,20 @@ function GM:PlayerInitialSpawn(ply)
     ply.RE4M_HandsBody    = "0000000"
     ply.RE4M_PlayerColor  = Vector(0.3, 1.0, 0.8)
     ply.RE4M_Ready        = false
+    RE4M_ApplyPlayerProgression(ply)
 
     ply:SetNWInt("RE4M_Score",    0)
     ply:SetNWInt("RE4M_Combo",    0)
     ply:SetNWInt("RE4M_MaxCombo", 0)
     ply:SetNWInt("RE4M_Kills",    0)
     ply:SetNWBool("RE4M_Ready",   false)
+    RE4M_UpdateLobbyReadyState()
 
     timer.Simple(3, function()
         if not IsValid(ply) then return end
 
         RE4M_SendWeaponList(ply)
+        RE4M_SendLobbyProgression()
 
         if not RE4M_STATE.HasNavmesh then
             -- FIX #7: This net message must be registered. Make sure
@@ -371,6 +519,20 @@ function GM:PlayerSetModel(ply)
     end
 end
 
+function RE4M_GiveAmmo(ply, amount, ammoType)
+    if not IsValid(ply) or not isnumber(ammoType) or ammoType < 0 then return end
+    amount = math.max(0, math.floor(tonumber(amount) or 0))
+    if amount <= 0 then return end
+
+    local ammoName = string.lower(game.GetAmmoName(ammoType) or "")
+    if string.find(ammoName, "grenade", 1, true) then
+        ply:SetAmmo(math.min(ply:GetAmmoCount(ammoType) + amount, 5), ammoType)
+        return
+    end
+
+    ply:GiveAmmo(amount, ammoType)
+end
+
 function RE4M_GiveLoadout(ply)
     if not IsValid(ply) then return end
 
@@ -399,10 +561,10 @@ function RE4M_GiveLoadout(ply)
 
                 -- -1 means "no ammo", 0+ is a valid ammo type index.
                 if primaryAmmo and primaryAmmo >= 0 then
-                    ply:GiveAmmo(cfg.StartingPrimaryAmmo or 90, primaryAmmo)
+                    RE4M_GiveAmmo(ply, cfg.StartingPrimaryAmmo or 90, primaryAmmo)
                 end
                 if secondaryAmmo and secondaryAmmo >= 0 then
-                    ply:GiveAmmo(cfg.StartingSecondaryAmmo or 30, secondaryAmmo)
+                    RE4M_GiveAmmo(ply, cfg.StartingSecondaryAmmo or 30, secondaryAmmo)
                 end
             end
         end
@@ -458,6 +620,13 @@ function GM:CanPlayerSuicide(ply)
 end
 
 function GM:PlayerDisconnected(ply)
+    if RE4M_STATE.GameState == GAMESTATE_MENU or RE4M_STATE.GameState == GAMESTATE_WAITING then
+        timer.Simple(0, function()
+            RE4M_UpdateLobbyReadyState()
+            RE4M_SendLobbyProgression()
+        end)
+    end
+
     if RE4M_STATE.GameState == GAMESTATE_ACTIVE then
         timer.Simple(1, function()
             local players = player.GetAll()
@@ -500,7 +669,10 @@ net.Receive("RE4M_SetLoadout", function(len, ply)
 
     for i = 1, count do
         local class = net.ReadString()
-        if class and class ~= "" then
+        local stored = class and weapons.GetStored(class)
+        if class and class ~= "" and stored and
+           RE4MERCS_IsWeaponAllowed(class, stored.Base or "", stored) and
+           not table.HasValue(loadout, class) then
             table.insert(loadout, class)
         end
     end
@@ -513,6 +685,10 @@ net.Receive("RE4M_SetLoadout", function(len, ply)
     end
 
     ply.RE4M_Loadout = loadout
+
+    if RE4M_SendLobbyProgression then
+        RE4M_SendLobbyProgression()
+    end
 
     if RE4MERCS_CONFIG and RE4MERCS_CONFIG.Debug then
         print("[RE4 Mercs] " .. ply:Nick() .. " set loadout: " .. table.concat(loadout, ", "))
@@ -527,19 +703,18 @@ net.Receive("RE4M_SetPlayermodel", function(len, ply)
 
     ply.RE4M_Playermodel = model
 
-    if IsValid(ply) and ply:Alive() then
-        ply:SetModel(model)
-        timer.Simple(0.05, function()
-            if IsValid(ply) then
-                ply:SetupHands()
-            end
-        end)
-    end
+    ply:SetModel(model)
+    timer.Simple(0.05, function()
+        if IsValid(ply) then
+            ply:SetupHands()
+        end
+    end)
 
     local handsInfo         = RE4M_GetHandsForModel(model)
     ply.RE4M_HandsModel     = handsInfo.model
     ply.RE4M_HandsSkin      = handsInfo.skin
     ply.RE4M_HandsBody      = handsInfo.body
+    RE4M_SendLobbyProgression()
 
     if RE4MERCS_CONFIG and RE4MERCS_CONFIG.Debug then
         print("[RE4 Mercs] " .. ply:Nick() .. " set model: " .. model)
@@ -549,18 +724,21 @@ end)
 
 net.Receive("RE4M_PlayerReady", function(len, ply)
     if not IsValid(ply) then return end  -- FIX #19: Validate ply
+    if RE4M_STATE.GameState ~= GAMESTATE_MENU and RE4M_STATE.GameState ~= GAMESTATE_WAITING then return end
 
     ply.RE4M_Ready = net.ReadBool()
     ply:SetNWBool("RE4M_Ready", ply.RE4M_Ready)
+    RE4M_UpdateLobbyReadyState()
 end)
 
 net.Receive("RE4M_StartGame", function(len, ply)
     if not IsValid(ply) then return end  -- FIX #20: Validate ply
 
-    if not ply:RE4M_IsAdmin() then return end
-
     if RE4M_STATE.GameState == GAMESTATE_MENU or
        RE4M_STATE.GameState == GAMESTATE_WAITING then
+        RE4M_UpdateLobbyReadyState()
+        if GetGlobalInt("RE4M_LobbyReadyCount", 0) < GetGlobalInt("RE4M_LobbyReadyRequired", 1) then return end
+        if CurTime() < GetGlobalFloat("RE4M_LobbyStartAt", 0) then return end
         RE4M_StartPreRound()
     end
 end)

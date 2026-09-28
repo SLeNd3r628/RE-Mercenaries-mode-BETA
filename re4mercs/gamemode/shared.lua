@@ -1,11 +1,20 @@
 -- RE4 Mercenaries Remake - Shared Code
 -- Runs on both client and server
 
-GM.Name    = "RE4 Mercenaries"
+GM.Name    = "RE Mercenaries"
 GM.Author  = "SLeNd3rMaN23"
 GM.Email   = ""
 GM.Website = ""
 GM.Base    = "base"
+
+-- mount wOS Blade Symphony animations for the parry
+wOS = wOS or {}
+wOS.AnimExtension = wOS.AnimExtension or {}
+wOS.AnimExtension.Mounted = wOS.AnimExtension.Mounted or {}
+
+wOS.AnimExtension.Mounted["Blade Symphony"] = true
+wOS.AnimExtension.Mounted[ "Resident Evil The Mercenaries" ] = true
+
 
 -- ============================================
 -- GAME STATES
@@ -28,6 +37,8 @@ RE4MERCS_NET = {
     "RE4M_SetPlayerBodygroups",
     "RE4M_SetPlayerSkin",
     "RE4M_SetPlayerColor",
+    "RE4M_ParryRequest",
+    "RE4M_PlayParryAnim",
     "RE4M_SetTheme",
     "RE4M_SetCustomNPCs",
     "RE4M_WeaponList",
@@ -47,14 +58,47 @@ RE4MERCS_NET = {
     "RE4M_DamageNumber",
     "RE4M_EnemyKilled",
     "RE4M_EliteSpawned",
-    "RE4M_EchoTeamMessage"
+    "RE4M_EchoTeamMessage",
+    -- Local TFA-VOX pack assignment for the player model selector.
+    "RE4M_AssignTFA_VOX",
+    "lf_playermodel_voxlist",
+    "RE4M_RequestProgression",
+    "RE4M_LobbyProgression",
+    "RE4M_BuySkill",
+    "RE4M_ToggleSkill",
+    "RE4M_SetEquippedSkills",
+    "RE4M_SkillShopResult"
 }
+
+-- Mercenary perks inspired by RE6's skills list, adapted to systems this mode
+-- actually has. Costs use Merc Points; each player can equip at most three.
+RE4M_SKILLS = {
+    { id = "eagle_eye", name = "Eagle Eye", cost = 8, description = "Sniper rifles deal 15% more damage.", effect = "sniper" },
+    { id = "item_drop", name = "Item Drop Increase", cost = 15, description = "Increases enemy pickup drop chance by 50%.", effect = "drop" },
+    { id = "go_for_broke", name = "Go For Broke!", cost = 18, description = "When 30 seconds or less remain, combo chains last 2 seconds longer.", effect = "combo_window" },
+    { id = "blitz_play", name = "Blitz Play", cost = 8, description = "Deal 15% more damage after a teammate recently damaged the same enemy.", effect = "blitz" },
+    { id = "quick_shot", name = "Quick Shot Damage Increase", cost = 12, description = "Deal 10% more firearm damage.", effect = "quick_shot" },
+    { id = "power_counter", name = "Power Counter", cost = 10, description = "Deal 25% more melee damage to parryable enemies during their attacks.", effect = "counter" },
+    { id = "second_wind", name = "Second Wind", cost = 8, description = "Deal 20% more damage below 30% health.", effect = "low_health" },
+    { id = "martial_arts", name = "Martial Arts Master", cost = 15, description = "Deal 25% more melee damage and 10% less firearm damage.", effect = "melee_master" },
+    { id = "target_master", name = "Target Master", cost = 15, description = "Deal 15% more firearm damage and 10% less melee damage.", effect = "firearm_master" },
+    { id = "last_stand", name = "Last Stand", cost = 20, description = "Deal 20% more damage, but take 50% more damage.", effect = "last_stand" },
+    { id = "preemptive_strike", name = "Preemptive Strike", cost = 10, description = "Deal 20% more damage when attacking an enemy from behind.", effect = "behind" },
+    { id = "dying_breath", name = "Dying Breath", cost = 12, description = "Deal 25% more damage below 20% health.", effect = "dying" },
+    { id = "pharmacist", name = "Pharmacist", cost = 12, description = "Health pickups restore 50% more health.", effect = "healing" },
+    { id = "medic", name = "Medic", cost = 12, description = "Health pickups also heal nearby teammates for half their value.", effect = "medic" },
+    { id = "first_responder", name = "First Responder", cost = 15, description = "Health pickups also restore 20 health to distant living teammates.", effect = "responder" },
+    { id = "take_it_easy", name = "Take It Easy", cost = 15, description = "Natural healing is faster while standing still.", effect = "stationary_healing" },
+    { id = "natural_healing", name = "Natural Healing", cost = 18, description = "Regenerate 1 health every 5 seconds while below maximum health.", effect = "regeneration" },
+    { id = "time_bonus", name = "Time Bonus +", cost = 25, description = "Time pickups grant 50% more time.", effect = "time_pickup" },
+    { id = "combo_bonus", name = "Combo Bonus +", cost = 20, description = "Combo milestone time bonuses are 25% larger.", effect = "combo_time" },
+    { id = "limit_breaker", name = "Limit Breaker", cost = 20, description = "Earn 10% more kill score while your combo is above 50.", effect = "score" },
+}
+RE4M_SKILLS_BY_ID = {}
+for _, skill in ipairs(RE4M_SKILLS) do RE4M_SKILLS_BY_ID[skill.id] = skill end
 
 -- ============================================
 -- CONFIG DEFAULTS + CONVARS
--- All scalar/bool/string settings from the old
--- re4mercs_config.lua are now ConVars (re4m_*).
--- Tables stay hardcoded (editable only by code).
 -- ============================================
 
 RE4MERCS_CONFIG = RE4MERCS_CONFIG or {}
@@ -171,33 +215,78 @@ RE4MERCS_CONFIG.EliteThresholds = {
     {kills = 130, maxElites = 3},
 }
 
+-- Weapon bases we accept.
+-- The whole Base inheritance chain is walked, so listing a root base is
+-- enough: a weapon whose Base is "arccw_gun" (which itself derives from
+-- "arccw_base") is still matched.
 RE4MERCS_CONFIG.AllowedBases = {
-    "arc9_base", "tfa_gun_base", "weapon_base", "bobs_gun_base",
-    "fas2_base", "m9k_base", "cw_base",
+    -- ARC9
+    "arc9_base",
+    -- ARCCW
+    "arccw_base", "arccw_gun", "arccw_base_melee",
+    -- TacRP
+    "tacrp_base", "tacrp_base_melee", "tacrp_base_giveitem", "tacrp_base_grenade",
+    -- Modern Warfare Base (MWB)
+    "mg_base", "mw_base", "mwb_base", "mg_base_melee", "mg_base_nade",
+    -- ASTW2
+    "astw2_base", "astw2_base_melee", "astw2_base_nade",
+    -- TFA Base
+    "tfa_gun_base", "tfa_bash_base", "tfa_melee_base", "tfa_base",
+    -- Misc / legacy
+    "weapon_base", "bobs_gun_base", "fas2_base", "m9k_base",
+    "cw_base", "weapon_cs_base", "weapon_tttbase",
 }
 
+-- Class-name prefixes we accept. Matching is case-insensitive.
 RE4MERCS_CONFIG.AllowedPrefixes = {
-    "arc9_", "tfa_", "weapon_", "m9k_", "cw_", "fas2_", "swep_",
+    "arc9_",                 -- ARC9
+    "arccw_",                -- ARCCW
+    "tacrp_",                -- TacRP
+    "mg_", "mw_", "mwb_",    -- Modern Warfare Base
+    "astw2_",                -- ASTW2
+    "tfa_",                  -- TFA Base
+    "cw_", "m9k_", "fas2_", "swep_", "weapon_",
+}
+
+-- Anything whose class STARTS WITH one of these is treated as a base SWEP
+-- or internal template and hidden from the loadout menu. This is what stops
+-- "ARCCW Base", "TacRP Base" etc. appearing as selectable guns.
+RE4MERCS_CONFIG.BlacklistedPrefixes = {
+    "arc9_base", "arccw_base", "tacrp_base", "astw2_base",
+    "tfa_base", "mg_base", "mw_base", "mwb_base",
+    "cw_base", "m9k_base", "fas2_base",
 }
 
 RE4MERCS_CONFIG.BlacklistedWeapons = {
     "weapon_physgun", "weapon_physcannon", "gmod_tool", "gmod_camera",
-    "weapon_fists", "arc9_cod2019_base", "arc9_cod2019_base_nade",
+    "weapon_fists",
+    "arc9_cod2019_base", "arc9_cod2019_base_nade",
+    "arccw_gun", "tfa_gun_base", "weapon_base",
 }
 
+-- Most weapon bases flag themselves Spawnable = false while real weapons
+-- are Spawnable = true. Leaving this on filters out base/template SWEPs
+-- automatically. Turn it off if one of your packs deliberately hides its
+-- weapons from the spawnmenu and you still want them selectable.
+RE4MERCS_CONFIG.HideNonSpawnable = true
+
 RE4MERCS_CONFIG.DefaultTheme = "default"
-RE4MERCS_CONFIG.EnabledThemes = { "default", "halflife", "custom" }
+RE4MERCS_CONFIG.EnabledThemes = { "default", "halflife", "re5", "custom" }
 
 RE4MERCS_CONFIG.ThemeNPCs = {
     default = {
         regular = { "npc_zombie", "npc_fastzombie", "npc_poisonzombie" },
         elite   = { "npc_fastzombie", "npc_poisonzombie" },
-        re4_regular = { "drg_roach_re4_ganado", "drg_roach_re4_dog" },
+        re4_regular = { "drg_roach_re4_ganado" },
         re4_elite   = { "drg_roach_re4_ganado_drs", "drg_roach_re4_garrador", "drg_roach_re4_brute" },
     },
     halflife = {
         regular = { "npc_zombie", "npc_fastzombie", "npc_antlion", "npc_antlion_worker" },
         elite   = { "npc_antlionguard", "npc_fastzombie", "npc_zombine", "npc_antlionguardian" },
+    },
+    re5 = {
+        regular = { "drg_roach_re5_amjn2", "drg_roach_re5_amjn0" },
+        elite   = { "drg_roach_re5_executioner", "drg_roach_re5_csawmjn", "drg_roach_re5_mgmjn", "drg_roach_re5_amjn1" },
     },
     custom = {
         regular = { "npc_combine_s", "npc_metropolice", "ShotgunSoldier", "npc_manhack" },
@@ -210,6 +299,7 @@ RE4MERCS_CONFIG.RoundMusic = {
     "re4mercs/HeatOnBeat.ogg",
     "re4mercs/RideonSea.ogg",
     "re4mercs/ThePressureIsOn.ogg",
+    "re4mercs/bgm001.ogg",
 }
 
 RE4MERCS_CONFIG.HUDColors = {
@@ -302,6 +392,12 @@ local RE4M_CVAR_MAP = {
     {"re4m_debug",                "Debug",                "0",   "Enable debug prints"},
     {"re4m_debugspawns",          "DebugSpawns",          "0",   "Show spawn debug"},
     {"re4m_allplayersadmin",      "AllPlayersAdmin",      "0",   "Everyone is admin (testing)"},
+
+    -- Parry
+    {"re4m_parry_enabled",  "ParryEnabled",  "1",   "Enable G-key parry against DrG nextbots"},
+    {"re4m_parry_range",    "ParryRange",    "120", "Max distance to parry"},
+    {"re4m_parry_cooldown", "ParryCooldown", "0.9", "Cooldown between parries"},
+    {"re4m_parry_duration", "ParryDuration", "0.95","How long the riposte animation locks"},
 }
 
 if SERVER then
@@ -441,15 +537,118 @@ RE4MERCS_WEAPON_CATEGORIES = {
 }
 
 RE4MERCS_CATEGORY_KEYWORDS = {
-    ["Assault Rifles"]  = {"assault", "rifle", "ar15", "ar-15", "carbine", "ak", "m4", "m16", "scar"},
-    ["Submachine Guns"] = {"smg", "submachine", "mp5", "mp7", "p90", "ump", "mac10", "uzi"},
-    ["Shotguns"]        = {"shotgun", "pump", "auto_shotgun", "benelli", "mossberg", "remington", "spas"},
-    ["Sniper Rifles"]   = {"sniper", "awp", "scout", "marksman", "dmr", "svd", "bolt"},
-    ["Pistols"]         = {"pistol", "handgun", "revolver", "deagle", "glock", "beretta", "1911", "usp"},
-    ["Machine Guns"]    = {"lmg", "machine_gun", "m249", "m60", "minigun", "mg"},
-    ["Melee"]           = {"melee", "knife", "sword", "bat", "crowbar", "axe", "machete", "fists"},
-    ["Explosives"]      = {"grenade", "rpg", "launcher", "explosive", "c4", "mine"},
+    -- Recognize weapon designations commonly used as class names / print
+    -- names by CoD, EFT, ARC9, TFA, and similar realistic weapon packs.
+    ["Assault Rifles"]  = {
+        "assault rifle", "assault_rifle", "ar15", "ar-15", "ar-10", "carbine", "battle rifle",
+        "ak47", "ak-47", "ak74", "ak-74", "akm", "ak12", "ak-12", "aks74", "aks-74",
+        "m4a1", "m4a4", "m16", "mk18", "hk416", "hk417", "scar", "fn fal", "f2000",
+        "aug", "famas", "galil", "g36", "qbz", "sig 55", "sig mcx", "acr", "kilo 141",
+        "ram-7", "cr-56", "as val", "groza", "an-94", "m13", "m13b", "kastov", "taq-56",
+        "m762", "beryl", "ace 32", "g36c", "l85", "sa80", "g3a3", "hk g3", "vhs-2",
+    },
+    ["Submachine Guns"] = {
+        "smg", "submachine", "mp5", "mp7", "mp9", "mp40", "mp5k", "p90", "ump", "ump45",
+        "mac10", "mac-10", "mac11", "uzi", "vector", "kriss", "thompson", "pp19", "pp-19",
+        "ppsh", "pp-19", "bizon", "m3 grease", "sten", "sterling", "scorpion evo", "akimbo smg",
+        "fennec", "lachmann sub", "iso 45", "hrm-9", "striker 9", "rival-9", "vel 46",
+        "mx9", "lc10", "milano", "bullfrog", "ots 9", "ksp 45", "tec-9", "p10 roni",
+    },
+    ["Shotguns"]        = {
+        "shotgun", "pump action", "pump_shotgun", "auto_shotgun", "benelli", "mossberg", "remington",
+        "spas", "striker", "saiga", "nova", "sawn", "m1014", "m590", "m870", "870 breacher",
+        "aa-12", "aa12", "ks-23", "ks23", "db shotgun", "double barrel", "super 90", "vepr-12",
+        "r9-0", "725", "lockwood 300", "expedite 12", "kv broadside", "haymaker", "reclaimer 18",
+    },
+    ["Sniper Rifles"]   = {
+        "sniper", "awp", "scout", "marksman", "dmr", "svd", "bolt action", "barrett", "intervention",
+        "kar98", "kar-98", "mosin", "m24", "m40a", "remington 700", "r700", "sv-98", "sv98",
+        "dragunov", "vss vintorez", "vpo-215", "m700", "m82", "m107", "ax-50", "hdr", "lynx",
+        "mcpr-300", "victus xmr", "fJx imperium", "signal 50", "la-b 330", "sp-x 80", "tundra",
+        "pelington", "lw3", "swiss k31", "zrg 20mm", "dmr rifle", "marksman rifle", "sr-25", "m110",
+    },
+    ["Pistols"]         = {
+        "pistol", "handgun", "revolver", "deagle", "desert eagle", "glock", "beretta", "1911", "usp",
+        "p226", "magnum", "fiveseven", "five-seven", "five seven", "m9a3", "m9 beretta", "m17", "m18",
+        "p320", "p250", "fnx-45", "fn 57", "five-seven", "walther", "makarov", "pm pistol", "tt-33",
+        "tokarev", "cz75", "cz-75", "cz p-", "glock 17", "glock 18", "glock 19", "glock 21", "glock 26",
+        "usp-s", "p2000", "p30", "mk23", "soc om", "r8 revolver", "python", "judge", "shorty",
+    },
+    ["Machine Guns"]    = {
+        "lmg", "machine gun", "machine_gun", "machinegun", "m249", "m240", "m60", "minigun", "rpd",
+        "pkm", "pkp", "mg42", "mg3", "mg34", "m1919", "m27 iar", "m250", "pkm", "rpk", "rpk-16",
+        "sa-58 lmg", "bruen mk9", "holger 26", "dg-58 lsw", "taq eradicator", "pulemyot", "kastov lsw",
+    },
+    ["Melee"]           = {
+        "melee", "knife", "sword", "bat", "crowbar", "axe", "machete", "fists", "katana", "hatchet",
+        "bayonet", "combat knife", "karambit", "kukri", "tomahawk", "tactical knife", "combat axe",
+    },
+    ["Explosives"]      = {
+        "grenade", "rpg", "launcher", "explosive", "c4", "mine", "rocket", "bazooka", "panzerfaust",
+        "m79", "m203", "gp-25", "gl40", "underbarrel grenade", "javelin", "stinger", "at4", "rpg-7",
+        "rpg7", "rpg-26", "rpg26", "rpg-18", "rpg18", "m32 grenade", "crossbow", "grenade launcher",
+    },
 }
+
+-- Categories are tested in THIS order. pairs() has no guaranteed order, which
+-- previously made a weapon land in a different category run to run. Specific
+-- categories are checked before broad ones ("Shotguns" before "Assault
+-- Rifles", so "auto shotgun rifle" isn't mislabelled).
+RE4MERCS_CATEGORY_ORDER = {
+    "Melee",
+    "Explosives",
+    "Shotguns",
+    "Sniper Rifles",
+    "Machine Guns",
+    "Submachine Guns",
+    "Pistols",
+    "Assault Rifles",
+}
+
+-- Keep the user-facing weapon browser and the lobby animation mapping on
+-- these same canonical names.
+RE4MERCS_CATEGORY_ALIASES = {
+    ["Assault Rifles"] = {"Assault Rifles", "AssaultRifle", "Rifle"},
+    ["Submachine Guns"] = {"Submachine Guns", "SubmachineGun", "SMG"},
+    ["Shotguns"] = {"Shotguns", "Shotgun"},
+    ["Sniper Rifles"] = {"Sniper Rifles", "Sniper"},
+    ["Machine Guns"] = {"Machine Guns", "MachineGun", "LMG"},
+    ["Pistols"] = {"Pistols", "Pistol", "Sidearm"},
+    ["Melee"] = {"Melee", "Knife"},
+    ["Explosives"] = {"Explosives", "Grenade"},
+}
+
+-- ============================================
+-- PARRY ANIMATION SYSTEM (wOS)
+-- ============================================
+
+local PLAYER = FindMetaTable("Player")
+
+function PLAYER:RE4M_IsParrying()
+    return self:GetNW2Float("RE4M_ParryTime", 0) >= CurTime()
+end
+
+function PLAYER:RE4M_GetParryTime()
+    return self:GetNW2Float("RE4M_ParryTime", 0)
+end
+
+-- Force the exact sequence while the flag is live
+hook.Add("CalcMainActivity", "RE4M_ParryAnimation", function(ply, velocity)
+    if not IsValid(ply) or not ply:RE4M_IsParrying() then return end
+
+    local seq = "b_block_forward_riposte"
+    local seqid = ply:LookupSequence(seq)
+    if seqid < 0 then return end
+
+    return -1, seqid
+end)
+
+hook.Add("UpdateAnimation", "RE4M_ParryPlayback", function(ply, velocity, maxSeqGroundSpeed)
+    if ply:RE4M_IsParrying() then
+        ply:SetPlaybackRate(1.0) -- adjust if it feels too fast/slow
+        return true
+    end
+end)
 
 -- ============================================
 -- SHARED UTILITY FUNCTIONS
@@ -468,16 +667,13 @@ function RE4MERCS_GetConfig()
         if cvar then
             local key = data[2]
             local val = cvar:GetString()
-            -- Try number first, then bool
-            local num = tonumber(val)
-            if num ~= nil then
-                cfg[key] = num
-            elseif val == "1" or val == "true" then
-                cfg[key] = true
-            elseif val == "0" or val == "false" then
-                cfg[key] = false
+            -- Preserve the default type: boolean ConVars must not become
+            -- numeric 0/1, because zero is truthy in Lua.
+            if type(RE4MERCS_CONFIG[key]) == "boolean" then
+                cfg[key] = val == "1" or val == "true"
             else
-                cfg[key] = val
+                local num = tonumber(val)
+                cfg[key] = num ~= nil and num or val
             end
         end
     end
@@ -513,13 +709,52 @@ function RE4MERCS_GetRank(score)
     return rank[2], rank[3], rank[1]
 end
 
-function RE4MERCS_CategorizeWeapon(className, printName)
-    local searchStr = string.lower(className .. " " .. (printName or ""))
+function RE4MERCS_CategorizeWeapon(className, printName, swepTable)
+    local searchStr = string.lower((className or "") .. " " .. (printName or ""))
 
-    for category, keywords in pairs(RE4MERCS_CATEGORY_KEYWORDS) do
-        for _, keyword in ipairs(keywords) do
-            if string.find(searchStr, keyword, 1, true) then
-                return category
+    -- Some bases publish a useful spawnmenu category, e.g. "ARC9 - Shotguns".
+    -- Fold it into the search string so it can help the match.
+    if swepTable and isstring(swepTable.Category) then
+        searchStr = searchStr .. " " .. string.lower(swepTable.Category)
+    end
+
+    -- Use explicit slot metadata where packs expose it. Numeric slot values
+    -- are base-specific, so only interpret recognizable string labels.
+    if swepTable then
+        local slot = swepTable.Slot or swepTable.SlotName or swepTable.WeaponType
+        if isstring(slot) then
+            local slotName = string.lower(slot)
+            if string.find(slotName, "shotgun", 1, true) then return "Shotguns" end
+            if string.find(slotName, "sniper", 1, true) or string.find(slotName, "marksman", 1, true) then return "Sniper Rifles" end
+            if string.find(slotName, "machine", 1, true) or string.find(slotName, "lmg", 1, true) then return "Machine Guns" end
+            if string.find(slotName, "smg", 1, true) or string.find(slotName, "submachine", 1, true) then return "Submachine Guns" end
+            if string.find(slotName, "pistol", 1, true) or string.find(slotName, "sidearm", 1, true) then return "Pistols" end
+            if string.find(slotName, "melee", 1, true) then return "Melee" end
+            if string.find(slotName, "launcher", 1, true) or string.find(slotName, "explosive", 1, true) then return "Explosives" end
+            if string.find(slotName, "rifle", 1, true) or string.find(slotName, "assault", 1, true) then return "Assault Rifles" end
+        end
+    end
+
+    -- Normalize punctuation to word boundaries so "m4_a1", "M4-A1", and
+    -- "M4 A1" match consistently, without letting short names like "aug" or
+    -- "scar" match inside unrelated words.
+    local normalized = string.lower(searchStr)
+    normalized = string.gsub(normalized, "[%p_]+", " ")
+    normalized = string.gsub(normalized, "%s+", " ")
+    normalized = " " .. normalized .. " "
+
+    local order = RE4MERCS_CATEGORY_ORDER or {}
+
+    for _, category in ipairs(order) do
+        local keywords = RE4MERCS_CATEGORY_KEYWORDS[category]
+        if keywords then
+            for _, keyword in ipairs(keywords) do
+                local normalizedKeyword = string.lower(keyword)
+                normalizedKeyword = string.gsub(normalizedKeyword, "[%p_]+", " ")
+                normalizedKeyword = string.gsub(normalizedKeyword, "%s+", " ")
+                if string.find(normalized, " " .. normalizedKeyword .. " ", 1, true) then
+                    return category
+                end
             end
         end
     end
@@ -527,40 +762,66 @@ function RE4MERCS_CategorizeWeapon(className, printName)
     return "Other"
 end
 
-function RE4MERCS_IsWeaponAllowed(className, base)
+--- Walk a weapon's Base chain and return a lookup table of every base in it.
+--- Guards against loops and missing entries.
+local function RE4MERCS_GetBaseChain(base)
+    local chain, seen = {}, {}
+    local current = base
+
+    for _ = 1, 16 do
+        if not current or current == "" or seen[current] then break end
+        seen[current]  = true
+        chain[current] = true
+
+        local stored = weapons.GetStored(current)
+        current = stored and stored.Base or nil
+    end
+
+    return chain
+end
+
+--- swepTable is optional but recommended: it lets us use Spawnable to
+--- filter out base SWEPs, and it is what RE4M_BuildWeaponList passes in.
+function RE4MERCS_IsWeaponAllowed(className, base, swepTable)
     local cfg = RE4MERCS_GetConfig()
+    if not cfg then return false end
+    if not className or className == "" then return false end
+
     base = base or ""
+    local lowerClass = string.lower(className)
 
-    local allowed = false
-
-    if cfg.AllowedPrefixes then
-        for _, prefix in ipairs(cfg.AllowedPrefixes) do
-            if string.StartWith(className, prefix) then
-                allowed = true
-                break
-            end
-        end
+    -- 1) Exact-class blacklist
+    for _, blocked in ipairs(cfg.BlacklistedWeapons or {}) do
+        if lowerClass == string.lower(blocked) then return false end
     end
 
-    if not allowed and cfg.AllowedBases then
-        for _, allowedBase in ipairs(cfg.AllowedBases) do
-            if base == allowedBase then
-                allowed = true
-                break
-            end
-        end
+    -- 2) Blacklisted prefixes (base SWEPs / internal templates)
+    for _, blocked in ipairs(cfg.BlacklistedPrefixes or {}) do
+        blocked = string.lower(blocked)
+        if string.sub(lowerClass, 1, #blocked) == blocked then return false end
     end
 
-    if allowed and cfg.BlacklistedWeapons then
-        for _, blocked in ipairs(cfg.BlacklistedWeapons) do
-            if className == blocked then
-                allowed = false
-                break
-            end
-        end
+    -- 3) Base SWEPs are nearly always flagged Spawnable = false
+    if cfg.HideNonSpawnable and swepTable and swepTable.Spawnable == false then
+        return false
     end
 
-    return allowed
+    -- 4) Class-name prefix whitelist
+    for _, prefix in ipairs(cfg.AllowedPrefixes or {}) do
+        prefix = string.lower(prefix)
+        if string.sub(lowerClass, 1, #prefix) == prefix then return true end
+    end
+
+    -- 5) Base whitelist, walking the FULL inheritance chain.
+    --    The old code only compared the immediate Base, so any pack whose
+    --    weapons derive from an intermediate base (very common in ARCCW,
+    --    TacRP and MW Base) was silently dropped.
+    local chain = RE4MERCS_GetBaseChain(base)
+    for _, allowedBase in ipairs(cfg.AllowedBases or {}) do
+        if chain[allowedBase] then return true end
+    end
+
+    return false
 end
 
 function RE4MERCS_FormatTime(seconds)

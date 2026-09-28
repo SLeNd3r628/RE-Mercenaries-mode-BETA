@@ -33,7 +33,12 @@ net.Receive("RE4M_AdminPanel", function(len, ply)
 
     elseif command == "set_max_npcs" then
         local max = net.ReadUInt(16)
-        RE4MERCS_CONFIG.BaseMaxNPCs = max
+        local cvar = GetConVar("re4m_basemaxnpcs")
+        if cvar then
+            cvar:SetInt(math.Clamp(max, 1, RE4MERCS_CONFIG.AbsoluteMaxNPCs or 40))
+        else
+            RE4MERCS_CONFIG.BaseMaxNPCs = max
+        end
 
     elseif command == "rebuild_weapons" then
         RE4M_BuildWeaponList()
@@ -71,6 +76,7 @@ hook.Add("PlayerSay", "RE4M_ChatCommands", function(ply, text, teamChat)
     elseif text == "!ready" or text == "/ready" then
         ply.RE4M_Ready = not ply.RE4M_Ready
         ply:SetNWBool("RE4M_Ready", ply.RE4M_Ready)
+        RE4M_UpdateLobbyReadyState()
         ply:ChatPrint("[RE4 Mercs] You are " .. (ply.RE4M_Ready and "READY" or "NOT READY"))
         return ""
 

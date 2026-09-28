@@ -92,6 +92,25 @@ function RE4M_GetActiveEliteCount()
     return count
 end
 
+-- Enemy levels follow the most progressed player in the current lobby,
+-- including connected players who are currently dead or spectating.
+function RE4M_GetHighestLobbyPlayerLevel()
+    local highest = 1
+    for _, ply in ipairs(player.GetAll()) do
+        if IsValid(ply) then
+            highest = math.max(highest, ply:GetNWInt("RE4M_PlayerLevel", 1))
+        end
+    end
+    return highest
+end
+
+function RE4M_GetEnemyLevelRange(playerLevel)
+    playerLevel = math.max(1, math.floor(tonumber(playerLevel) or 1))
+    local minimum = math.max(1, math.floor(playerLevel * 0.8))
+    local maximum = math.max(minimum, math.ceil(playerLevel * 1.16))
+    return minimum, maximum
+end
+
 function RE4M_ShouldSpawnElite()
     local maxElites = RE4M_GetMaxElites()
     if maxElites <= 0 then return false end
@@ -413,12 +432,31 @@ function RE4M_SpawnEnemy(pos, forceElite)
     enemy.RE4M_Spawned   = true
     enemy.RE4M_IsElite   = isElite
     enemy.RE4M_SpawnTime = CurTime()
+    enemy:SetNWBool("RE4M_Spawned", true)
+    enemy:SetNWBool("RE4M_IsElite", isElite)
+    local playerLevel = RE4M_GetHighestLobbyPlayerLevel()
+    local minEnemyLevel, maxEnemyLevel = RE4M_GetEnemyLevelRange(playerLevel)
+    local enemyLevel = math.random(minEnemyLevel, maxEnemyLevel)
+    enemy.RE4M_Level = enemyLevel
+    enemy:SetNWInt("RE4M_EnemyLevel", enemyLevel)
+
+    -- Scale from the entity's initialized health so custom NPC/NextBot base
+    -- values remain intact. Elite health keeps its existing 1.5x multiplier.
+    local healthScale = 1 + math.max(0, enemyLevel - 1) * 0.05
+    if isElite then healthScale = healthScale * 1.5 end
+    pcall(function()
+        local originalHealth = math.max(tonumber(enemy:Health()) or 0, 1)
+        local originalMaxHealth = math.max(tonumber(enemy:GetMaxHealth()) or 0, originalHealth)
+        local scaledMaxHealth = math.max(1, math.floor(originalMaxHealth * healthScale))
+        local healthFraction = math.Clamp(originalHealth / originalMaxHealth, 0, 1)
+        enemy:SetMaxHealth(scaledMaxHealth)
+        enemy:SetHealth(math.max(1, math.floor(scaledMaxHealth * healthFraction)))
+        enemy:SetNWInt("RE4M_EnemyMaxHealth", scaledMaxHealth)
+    end)
 
     if isElite then
         pcall(function()
             enemy:SetModelScale(1.2, 0)
-           enemy:SetMaxHealth(enemy:GetMaxHealth() * 1.5)
-           enemy:SetHealth(enemy:GetMaxHealth())
         end)
 
         timer.Simple(0.1, function()
@@ -427,6 +465,9 @@ function RE4M_SpawnEnemy(pos, forceElite)
             end
         end)
     end
+
+    local maxHealth = math.max(enemy:GetNWInt("RE4M_EnemyMaxHealth", enemy:GetMaxHealth()), 1)
+    enemy:SetNWFloat("RE4M_HealthFrac", math.Clamp(enemy:Health() / maxHealth, 0, 1))
 
     -- Deferred AI setup (runs next tick, avoids calling NPC functions before
     -- the engine has fully initialised the entity).
@@ -804,15 +845,6 @@ hook.Add("OnNPCKilled", "RE4M_NPCKilled", function(npc, attacker, inflictor)
             net.WriteEntity(attacker)
         net.Broadcast()
 
-        timer.Simple(0.1, function()
-            for _, rag in ipairs(ents.FindByClass("prop_ragdoll")) do
-                if IsValid(rag) and not rag.RE4M_Ragdoll then
-                    if rag:GetPos():DistToSqr(npcPos) < (200 ^ 2) then
-                        rag.RE4M_Ragdoll = true
-                    end
-                end
-            end
-        end)
     end
 
     for i, tracked in ipairs(RE4M_STATE.ActiveNPCs) do
@@ -874,12 +906,12 @@ hook.Add("EntityTakeDamage", "RE4M_DamageEvents", function(target, dmgInfo)
         net.Send(attacker)  -- only the shooter needs to see their own damage numbers
     end
 
-    local now = CurTime()
-    if (target.RE4M_LastHealthSync or 0) + 0.1 > now then return end
-    target.RE4M_LastHealthSync = now
-
+    -- Coalesce same-tick damage events, but never drop the final health update.
+    if target.RE4M_HealthSyncPending then return end
+    target.RE4M_HealthSyncPending = true
     timer.Simple(0, function()
         if not IsValid(target) then return end
+        target.RE4M_HealthSyncPending = nil
         local ok, h   = pcall(target.Health, target)
         local ok2, mh = pcall(target.GetMaxHealth, target)
         if ok and ok2 and h and mh and mh > 0 then
@@ -889,13 +921,11 @@ hook.Add("EntityTakeDamage", "RE4M_DamageEvents", function(target, dmgInfo)
     end)
 end)
 
-hook.Add("OnEntityCreated", "RE4M_InitHealthSync", function(ent)
-    timer.Simple(0.2, function()
-        if IsValid(ent) and ent.RE4M_Spawned then
-            ent:SetNWFloat("RE4M_HealthFrac", 1.0)
-            ent:SetNWBool("RE4M_IsElite", ent.RE4M_IsElite or false)
-        end
-    end)
+-- Tag only ragdolls produced by this mode's enemies. The previous kill hook
+-- searched every ragdoll after every kill, and missed matches accumulated.
+hook.Add("CreateEntityRagdoll", "RE4M_TagEnemyRagdolls", function(source, ragdoll)
+    if not IsValid(source) or not source.RE4M_Spawned or not IsValid(ragdoll) then return end
+    ragdoll.RE4M_Ragdoll = true
 end)
 
 -- ============================================
