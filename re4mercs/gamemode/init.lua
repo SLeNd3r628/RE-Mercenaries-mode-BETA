@@ -8,6 +8,8 @@ AddCSLuaFile("cl_menu.lua")
 AddCSLuaFile("cl_music.lua")
 AddCSLuaFile("cl_results.lua")
 AddCSLuaFile("cl_camera_movement.lua")
+AddCSLuaFile("cl_roll.lua")
+AddCSLuaFile("cl_hudblock.lua")
 
 include("shared.lua")
 include("sv_scoring.lua")
@@ -17,6 +19,7 @@ include("sv_rounds.lua")
 include("sv_pickups.lua")
 include("sv_admin.lua")
 include("sv_wos_anims.lua")
+include("sv_roll.lua")
 include("sv_vox.lua")
 
 -- ============================================
@@ -41,6 +44,18 @@ local soundFiles = {
     "sound/re4mercs/RideonSea.ogg",
     "sound/re4mercs/ThePressureIsOn.ogg",
     "sound/re4mercs/bgm001.ogg",
+    "sound/re4mercs/foot_kickwall.wav",
+    "sound/re4mercs/kickopendoor.wav",
+    "sound/re4mercs/foot_whoosh.wav",
+    "sound/re4mercs/foot_kickbody.wav",
+    "sound/re4mercs/Body_Roll_01.wav",
+    "sound/re4mercs/Body_Roll_02.wav",
+    "sound/re4mercs/Body_Roll_03.wav",
+    "sound/re4mercs/Body_Roll_04.wav",
+    "sound/re4mercs/knife_draw.wav",
+    "sound/re4mercs/knife_parry.wav",
+    "sound/re4mercs/knife_slash.wav",
+    "sound/re4mercs/ammo_pickup.wav",
     "sound/ui/results.ogg",
     "sound/ui/menu.ogg",
     "sound/ui/combo_milestone.ogg",
@@ -49,7 +64,8 @@ local soundFiles = {
     "sound/ui/pickup_ammo.ogg",
     "sound/ui/pickup_time.ogg",
     "sound/ui/round_start.ogg",
-    "sound/ui/round_end.ogg",
+    "sound/ui/round_end.wav",
+    "sound/ui/btn_click.wav",
     "sound/ui/countdown.ogg",
     "sound/ui/rank_reveal.ogg",
     "sound/ui/ui_ready.wav",
@@ -71,9 +87,16 @@ for _, f in ipairs(soundFiles) do
 end
 
 local materialFiles = {
+    "materials/re4beam/beam.vmt",
+    "materials/re4beam/beam.vtf",
     "materials/vgui/re4mercs/background.png",
     "materials/vgui/re4mercs/background_lobby.png",
     "materials/vgui/re4mercs/vignette.png",
+    "materials/vgui/re4mercs/herb_used_vignette.png",
+    "materials/vgui/re4mercs/perfect_dodge_vingette.png",
+    "materials/vgui/re4mercs/gethit_1.png",
+    "materials/vgui/re4mercs/gethit_2.png",
+    "materials/vgui/re4mercs/gethit_3.png",
     "materials/vgui/re4mercs/logo.png",
     "materials/vgui/re4mercs/slot_bg.png",
     "materials/vgui/re4mercs/rank_bg.png",
@@ -174,8 +197,11 @@ function RE4M_SetGameState(state)
         return
     end
 
+    local previousState = RE4M_STATE.GameState
     RE4M_STATE.GameState = state
     SetGlobalInt("RE4M_GameState", state)
+
+    hook.Run("RE4M_GameStateChanged", previousState, state)
 
     -- The start timer begins only after the lobby's ready-player minimum is met.
     if state == GAMESTATE_MENU then
@@ -398,6 +424,39 @@ function GM:InitPostEntity()
     end)
 end
 
+local MAX_BODYGROUP_STRING = 256
+
+--- Restore the playermodel the client saved last session. The re4m_player*
+--- client ConVars are USERINFO, but nothing read them back on join, so every
+--- reconnect reset the player to the default model until they re-applied it.
+local function RE4M_ApplySavedAppearance(ply)
+    local model = ply:GetInfo("re4m_playermodel") or ""
+    if model ~= "" and #model <= 260 and util.IsValidModel(model) then
+        ply.RE4M_Playermodel = model
+        local handsInfo = RE4M_GetHandsForModel(model)
+        ply.RE4M_HandsModel = handsInfo.model
+        ply.RE4M_HandsSkin  = handsInfo.skin
+        ply.RE4M_HandsBody  = handsInfo.body
+    end
+
+    ply.RE4M_Skin = math.Clamp(math.floor(ply:GetInfoNum("re4m_playerskin", 0)), 0, 255)
+
+    local bodygroups = ply:GetInfo("re4m_playerbodygroups") or ""
+    if #bodygroups <= MAX_BODYGROUP_STRING then
+        ply.RE4M_Bodygroups = bodygroups
+    end
+
+    local function channel(name, default)
+        local value = ply:GetInfoNum(name, default)
+        if value ~= value then value = default end -- NaN
+        return math.Clamp(value, 0, 1)
+    end
+    ply.RE4M_PlayerColor = Vector(
+        channel("re4m_playercolor_r", 0.3),
+        channel("re4m_playercolor_g", 1.0),
+        channel("re4m_playercolor_b", 0.8))
+end
+
 function GM:PlayerInitialSpawn(ply)
     ply.RE4M_Loadout      = {}
     ply.RE4M_Playermodel  = ""
@@ -408,6 +467,7 @@ function GM:PlayerInitialSpawn(ply)
     ply.RE4M_HandsBody    = "0000000"
     ply.RE4M_PlayerColor  = Vector(0.3, 1.0, 0.8)
     ply.RE4M_Ready        = false
+    RE4M_ApplySavedAppearance(ply)
     RE4M_ApplyPlayerProgression(ply)
 
     ply:SetNWInt("RE4M_Score",    0)
@@ -455,11 +515,15 @@ function GM:PlayerSpawn(ply)
     local cfg = RE4MERCS_GetConfig()
     if not cfg then return end  -- FIX #9: Guard against nil config
 
+    -- Max health must match, otherwise it stays at the engine default of 100:
+    -- herbs and regeneration capped at 100 and the HUD bar overflowed.
+    ply:SetMaxHealth(cfg.PlayerHealth or 150)
     ply:SetHealth(cfg.PlayerHealth   or 150)
     ply:SetArmor(cfg.PlayerArmor     or 50)
     ply:SetRunSpeed(cfg.PlayerRunSpeed  or 300)
     ply:SetWalkSpeed(cfg.PlayerWalkSpeed or 200)
-    ply:SetJumpPower(200)
+    -- Jump is reserved for the combat roll action.
+    ply:SetJumpPower(0)
 
     if ply.RE4M_Playermodel and ply.RE4M_Playermodel ~= "" then
         ply:SetModel(ply.RE4M_Playermodel)
@@ -494,6 +558,8 @@ function GM:PlayerSpawn(ply)
             end
         end)
     else
+        -- Freeze persists across Spawn(); a mid-round (re)spawn must be able to move.
+        ply:Freeze(false)
         RE4M_GiveLoadout(ply)
     end
 end
@@ -579,22 +645,36 @@ function GM:PlayerLoadout(ply)
 end
 
 function GM:PlayerDeathThink(ply)
-    if RE4M_STATE.GameState == GAMESTATE_ACTIVE then
-        local cfg = RE4MERCS_GetConfig()
-        -- FIX #12: Guard cfg before indexing it.
-        if cfg and not cfg.RespawnEnabled then
-            return false
-        end
-    end
+    -- Outside a live round the round flow (RE4M_ReturnToMenu / StartPreRound)
+    -- respawns everyone, so dead players just wait.
+    if RE4M_STATE.GameState ~= GAMESTATE_ACTIVE then return false end
 
-    if ply:KeyDown(IN_ATTACK) or ply:KeyDown(IN_JUMP) then
-        --// ply:Spawn()
+    local cfg = RE4MERCS_GetConfig()
+    if not cfg or not cfg.RespawnEnabled then return false end
+
+    -- re4m_respawnenabled was never implemented: the respawn call was
+    -- commented out. Respawn after the delay on attack/jump/use.
+    local delay = math.max(0, tonumber(cfg.RespawnDelay) or 5)
+    if CurTime() < (ply.RE4M_DeathTime or 0) + delay then return false end
+
+    if ply:KeyDown(IN_ATTACK) or ply:KeyDown(IN_JUMP) or ply:KeyDown(IN_USE) then
+        ply:Spawn()
     end
 
     return false
 end
 
 function GM:PlayerDeath(ply, inflictor, attacker)
+    ply.RE4M_DeathTime = CurTime()
+
+    local cfg = RE4MERCS_GetConfig()
+    if RE4M_STATE.GameState == GAMESTATE_ACTIVE and cfg and cfg.RespawnEnabled then
+        -- Lets the HUD show the respawn countdown.
+        ply:SetNW2Float("RE4M_RespawnAt", CurTime() + math.max(0, tonumber(cfg.RespawnDelay) or 5))
+        -- With respawns on, a team wipe is not the end of the round.
+        return
+    end
+
     if RE4M_STATE.GameState == GAMESTATE_ACTIVE then
         local anyAlive = false
         for _, p in ipairs(player.GetAll()) do
@@ -608,11 +688,26 @@ function GM:PlayerDeath(ply, inflictor, attacker)
         end
 
         if not anyAlive then
-            timer.Simple(2, function()
+            local deathRound = RE4M_STATE.RoundNumber
+            timer.Create("RE4M_LastPlayerDeathEnd", 2, 1, function()
+                if RE4M_STATE.GameState ~= GAMESTATE_ACTIVE or RE4M_STATE.RoundNumber ~= deathRound then return end
+
+                for _, playerEntity in ipairs(player.GetAll()) do
+                    if IsValid(playerEntity) and playerEntity:Alive() then return end
+                end
+
                 RE4M_EndRound()
             end)
         end
     end
+end
+
+-- Grab/decapitation attacks from the RE4/RE5 NextBots kill through
+-- KillSilent (DrGBase's DrG_RagdollDeath), which calls PlayerSilentDeath and
+-- never PlayerDeath. Without this, a grab on the last living player left the
+-- round running with nobody alive, and action/roll state was never reset.
+function GM:PlayerSilentDeath(ply)
+    hook.Run("PlayerDeath", ply, ply, ply)
 end
 
 function GM:CanPlayerSuicide(ply)
@@ -699,7 +794,7 @@ net.Receive("RE4M_SetPlayermodel", function(len, ply)
     if not IsValid(ply) then return end  -- FIX #18: Validate ply
 
     local model = net.ReadString()
-    if not model or model == "" or not util.IsValidModel(model) then return end
+    if not model or model == "" or #model > 260 or not util.IsValidModel(model) then return end
 
     ply.RE4M_Playermodel = model
 
@@ -743,16 +838,13 @@ net.Receive("RE4M_StartGame", function(len, ply)
     end
 end)
 
-net.Receive("RE4M_SetTheme", function(len, ply)
-    if not IsValid(ply) then return end  -- FIX #21: Validate ply
-
-    if not ply:RE4M_IsAdmin() then return end
-
-    local theme = net.ReadString()
-    local cfg   = RE4MERCS_GetConfig()
-
-    -- FIX #22: Guard cfg and EnabledThemes before iterating.
-    if not cfg then return end
+--- Validate and apply a theme. Shared by the menu, console and chat commands;
+--- the console and chat versions previously accepted any string, which left
+--- the spawner on a theme with no NPC table.
+function RE4M_SetTheme(theme)
+    theme = string.lower(string.Trim(tostring(theme or "")))
+    local cfg = RE4MERCS_GetConfig()
+    if not cfg then return false end
 
     local valid = false
     for _, t in ipairs(cfg.EnabledThemes or {}) do
@@ -761,54 +853,58 @@ net.Receive("RE4M_SetTheme", function(len, ply)
             break
         end
     end
+    if not valid then return false end
 
-    if valid then
-        RE4M_STATE.CurrentTheme = theme
+    RE4M_STATE.CurrentTheme = theme
 
-        net.Start("RE4M_ThemeInfo")
-            net.WriteString(theme)
-        net.Broadcast()
+    net.Start("RE4M_ThemeInfo")
+        net.WriteString(theme)
+    net.Broadcast()
 
-        if RE4MERCS_CONFIG and RE4MERCS_CONFIG.Debug then
-            print("[RE4 Mercs] Theme set to: " .. theme)
-        end
+    if RE4MERCS_CONFIG and RE4MERCS_CONFIG.Debug then
+        print("[RE4 Mercs] Theme set to: " .. theme)
     end
+    return true
+end
+
+net.Receive("RE4M_SetTheme", function(len, ply)
+    if not IsValid(ply) or not ply:RE4M_IsAdmin() then return end
+    RE4M_SetTheme(net.ReadString())
 end)
 
+local MAX_CUSTOM_NPCS = 64
+
 net.Receive("RE4M_SetCustomNPCs", function(len, ply)
-    if not IsValid(ply) then return end  -- FIX #23: Validate ply
+    if not IsValid(ply) or not ply:RE4M_IsAdmin() then return end
 
-    if not ply:RE4M_IsAdmin() then return end
-
-    local regularCount = net.ReadUInt(8)
-    -- FIX #24: Cap counts from clients to prevent oversized loops.
-    regularCount = math.Clamp(regularCount, 0, 255)
-
-    local regular = {}
-    for i = 1, regularCount do
-        table.insert(regular, net.ReadString())
+    local function ReadClassList()
+        local count = math.min(net.ReadUInt(8), MAX_CUSTOM_NPCS)
+        local list = {}
+        for i = 1, count do
+            local class = string.Trim(net.ReadString())
+            if class ~= "" and #class <= 128 and not table.HasValue(list, class) then
+                list[#list + 1] = class
+            end
+        end
+        return list
     end
 
-    local eliteCount = net.ReadUInt(8)
-    eliteCount = math.Clamp(eliteCount, 0, 255)
+    local regular = ReadClassList()
+    local elite   = ReadClassList()
 
-    local elite = {}
-    for i = 1, eliteCount do
-        table.insert(elite, net.ReadString())
-    end
-
-    local cfg = RE4MERCS_GetConfig()
-    if not cfg then return end  -- FIX #25: Guard cfg
-
-    cfg.ThemeNPCs         = cfg.ThemeNPCs or {}
-    cfg.ThemeNPCs.custom  = {
-        regular = regular,
-        elite   = elite,
-    }
+    -- The old handler wrote into the copy returned by RE4MERCS_GetConfig()
+    -- (it only worked by accident through a shared sub-table) and forgot the
+    -- lists on map change. RE4M_SetCustomNPCLists stores and persists them.
+    RE4M_SetCustomNPCLists(regular, elite)
 
     if RE4MERCS_CONFIG and RE4MERCS_CONFIG.Debug then
         print("[RE4 Mercs] Custom NPCs set: " .. #regular .. " regular, " .. #elite .. " elite")
     end
+end)
+
+net.Receive("RE4M_RequestCustomNPCs", function(len, ply)
+    if not IsValid(ply) or not ply:RE4M_IsAdmin() then return end
+    RE4M_SendCustomNPCLists(ply)
 end)
 
 
@@ -841,6 +937,7 @@ net.Receive("RE4M_SetPlayerBodygroups", function(len, ply)
     if not IsValid(ply) then return end  -- FIX #27: Validate ply
 
     local bgString = net.ReadString()
+    if #bgString > MAX_BODYGROUP_STRING then return end
 
     ply.RE4M_Bodygroups = bgString
 
@@ -879,8 +976,9 @@ net.Receive("RE4M_SetPlayerColor", function(len, ply)
     local g = net.ReadFloat()
     local b = net.ReadFloat()
 
-    -- FIX #30: Clamp color components so a client cannot send NaN or huge
-    -- values that could corrupt SetPlayerColor.
+    -- Clamp color components so a client cannot send huge values. NaN passes
+    -- straight through math.Clamp, so reject it explicitly.
+    if r ~= r or g ~= g or b ~= b then return end
     r = math.Clamp(r, 0, 1)
     g = math.Clamp(g, 0, 1)
     b = math.Clamp(b, 0, 1)
@@ -1013,13 +1111,10 @@ concommand.Add("re4m_theme", function(ply, cmd, args)
     if IsValid(ply) and not ply:RE4M_IsAdmin() then return end
 
     if args[1] then
-        RE4M_STATE.CurrentTheme = args[1]
-
-        net.Start("RE4M_ThemeInfo")
-            net.WriteString(args[1])
-        net.Broadcast()
-
-        local msg = "[RE4 Mercs] Theme set to: " .. args[1]
+        local cfg = RE4MERCS_GetConfig()
+        local msg = RE4M_SetTheme(args[1])
+            and ("[RE4 Mercs] Theme set to: " .. RE4M_STATE.CurrentTheme)
+            or ("[RE4 Mercs] Unknown theme. Valid: " .. table.concat(cfg.EnabledThemes or {}, ", "))
         if IsValid(ply) then ply:ChatPrint(msg) else print(msg) end
     end
 end)
@@ -1037,18 +1132,19 @@ concommand.Add("re4m_rebuild_weapons", function(ply, cmd, args)
     if IsValid(ply) then ply:ChatPrint(msg) else print(msg) end
 end)
 
-concommand.Add("re4m_debug", function(ply, cmd, args)
+-- This used to be a concommand named "re4m_debug", which collided with the
+-- re4m_debug ConVar of the same name. Toggle the ConVar instead; the change
+-- callback in shared.lua keeps RE4MERCS_CONFIG.Debug in sync.
+concommand.Add("re4m_toggle_debug", function(ply, cmd, args)
     if IsValid(ply) and not ply:RE4M_IsAdmin() then return end
 
-    -- FIX #33: RE4MERCS_CONFIG could be nil if shared.lua never ran.
-    if not RE4MERCS_CONFIG then
-        local msg = "[RE4 Mercs] RE4MERCS_CONFIG is nil - shared.lua may not have loaded."
-        if IsValid(ply) then ply:ChatPrint(msg) else print(msg) end
-        return
-    end
+    local cvar = GetConVar("re4m_debug")
+    if not cvar then return end
+    local enabled = not cvar:GetBool()
+    cvar:SetBool(enabled)
+    RE4MERCS_CONFIG.Debug = enabled
 
-    RE4MERCS_CONFIG.Debug = not RE4MERCS_CONFIG.Debug
-    local msg = "[RE4 Mercs] Debug mode: " .. tostring(RE4MERCS_CONFIG.Debug)
+    local msg = "[RE4 Mercs] Debug mode: " .. tostring(cvar:GetBool())
     if IsValid(ply) then ply:ChatPrint(msg) else print(msg) end
 end)
 

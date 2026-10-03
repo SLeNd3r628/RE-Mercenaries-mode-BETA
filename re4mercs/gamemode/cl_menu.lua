@@ -446,8 +446,10 @@ function RE4M_CreateLobbyPanel(parent)
     -- The replicated player field is authoritative for the local player's
     -- ownership, including when a broadcast snapshot refreshed the lobby cache.
     if IsValid(localPlayer) then
-        local ownedJson = localPlayer:GetNWString("RE4M_OwnedSkills", "[]")
-        local ownedSkills = util.JSONToTable(ownedJson) or {}
+        -- NW2 string: NW strings were truncated at 199 bytes, which broke
+        -- this JSON once enough skills were owned.
+        local ownedJson = localPlayer:GetNW2String("RE4M_OwnedSkills", "")
+        local ownedSkills = ownedJson ~= "" and util.JSONToTable(ownedJson) or nil
         if istable(ownedSkills) then
             localProfile = table.Copy(localProfile)
             localProfile.ownedSkills = ownedSkills
@@ -945,7 +947,7 @@ function RE4M_CreateLoadoutPanel(parent)
         clearBtn.DoClick = function(self)
             RE4M_CLIENT.SelectedLoadout[self.SlotIndex] = nil
             RE4M_SendLoadout()
-            surface.PlaySound("ui/btn_click.wav")
+            RE4M_PlayUISound("ui/btn_click.wav", "garrysmod/ui_click.wav")
         end
     end
 
@@ -979,6 +981,16 @@ function RE4M_CreateLoadoutPanel(parent)
     weaponList.OnRowSelected = function(panel, rowIndex, row)
         if not row or not row.WeaponData then return end
 
+        -- The server drops duplicate classes, so selecting the same weapon
+        -- twice used to show it in two slots but give it only once.
+        for j = 1, maxSlots do
+            local selected = RE4M_CLIENT.SelectedLoadout[j]
+            if selected and selected.class == row.WeaponData.class then
+                notification.AddLegacy("That weapon is already in your loadout.", NOTIFY_HINT, 3)
+                return
+            end
+        end
+
         local slotIdx
         for j = 1, maxSlots do
             if RE4M_CLIENT.SelectedLoadout[j] == nil then
@@ -1007,7 +1019,7 @@ function RE4M_CreateLoadoutPanel(parent)
             end)
         end
 
-        surface.PlaySound("ui/btn_click.wav")
+        RE4M_PlayUISound("ui/btn_click.wav", "garrysmod/ui_click.wav")
     end
 end
 
@@ -1022,8 +1034,11 @@ function RE4M_SendLoadout()
         end
     end
 
+    -- Remember the loadout for the next session (see RE4M_RestoreSavedLoadout).
+    RunConsoleCommand("re4m_loadout", table.concat(classes, ","))
+
     net.Start("RE4M_SetLoadout")
-        net.WriteUInt(#classes, 4)
+        net.WriteUInt(math.min(#classes, 15), 4)
         for _, class in ipairs(classes) do
             net.WriteString(class)
         end
@@ -1464,7 +1479,7 @@ function RE4M_CreatePlayermodelPanel(parent)
                     net.WriteString(packModel)
                 net.SendToServer()
                 state.voxPackPath = packModel
-                surface.PlaySound("ui/btn_click.wav")
+                RE4M_PlayUISound("ui/btn_click.wav", "garrysmod/ui_click.wav")
             end
 
             if #packChoices == 0 then
@@ -1622,7 +1637,7 @@ function RE4M_CreatePlayermodelPanel(parent)
         net.SendToServer()
 
         RE4M_CLIENT.SelectedModel = state.modelPath
-        surface.PlaySound("ui/btn_click.wav")
+        RE4M_PlayUISound("ui/btn_click.wav", "garrysmod/ui_click.wav")
 
         statusLabel:SetText("✓ Applied: " .. (state.modelName ~= "" and state.modelName or string.GetFileFromFilename(state.modelPath)))
         statusLabel:SetTextColor(Color(50, 255, 50))
@@ -1662,7 +1677,7 @@ function RE4M_CreatePlayermodelPanel(parent)
 
         rebuildRetries = 0
         RebuildControls()
-        surface.PlaySound("ui/btn_click.wav")
+        RE4M_PlayUISound("ui/btn_click.wav", "garrysmod/ui_click.wav")
     end
 
     -- ========================================
@@ -1685,7 +1700,7 @@ function RE4M_CreatePlayermodelPanel(parent)
 
                 icon.DoClick = function()
                     SetPreviewModel(path, name)
-                    surface.PlaySound("ui/btn_click.wav")
+                    RE4M_PlayUISound("ui/btn_click.wav", "garrysmod/ui_click.wav")
                 end
 
                 icon.DoDoubleClick = function()
@@ -1720,6 +1735,121 @@ function RE4M_CreatePlayermodelPanel(parent)
     SetPreviewModel(state.modelPath, initialName)
 end
 -- ============================================
+-- ADMIN PANEL
+-- ============================================
+-- The server has always handled RE4M_AdminPanel commands (sv_admin.lua), but
+-- nothing on the client could send them. Opened from the theme tab, the
+-- "re4m_adminpanel" console command or the !admin chat command, so it also
+-- works mid-round when the lobby menu is closed.
+
+local AdminPanelFrame
+
+local function SendAdminCommand(command, writer)
+    net.Start("RE4M_AdminPanel")
+        net.WriteString(command)
+        if writer then writer() end
+    net.SendToServer()
+    RE4M_PlayUISound("ui/btn_click.wav", "garrysmod/ui_click.wav")
+end
+
+local function PaintAdminButton(self, w, h)
+    draw.RoundedBox(4, 0, 0, w, h, self:IsHovered() and Color(170, 50, 50) or Color(95, 35, 35))
+end
+
+function RE4M_OpenAdminPanel()
+    if not IsValid(LocalPlayer()) or not LocalPlayer():RE4M_IsAdmin() then
+        chat.AddText(Color(255, 80, 80), "[RE4 Mercs] ", Color(255, 255, 255), "Admin access required.")
+        return
+    end
+    if IsValid(AdminPanelFrame) then AdminPanelFrame:Remove() end
+
+    local frame = vgui.Create("DFrame")
+    AdminPanelFrame = frame
+    frame:SetSize(360, 330)
+    frame:Center()
+    frame:SetTitle("")
+    frame:MakePopup()
+    frame.Paint = function(self, w, h)
+        draw.RoundedBox(8, 0, 0, w, h, Color(25, 12, 12, 245))
+        surface.SetDrawColor(180, 50, 50, 180)
+        surface.DrawOutlinedRect(0, 0, w, h, 2)
+        draw.SimpleText("RE MERCENARIES  -  ADMIN", "RE4M_Small", 12, 6,
+            Color(255, 90, 90), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+    end
+
+    local stateNames = {
+        [GAMESTATE_MENU] = "LOBBY", [GAMESTATE_PREROUND] = "PRE-ROUND",
+        [GAMESTATE_ACTIVE] = "ROUND ACTIVE", [GAMESTATE_POSTROUND] = "RESULTS",
+        [GAMESTATE_WAITING] = "WAITING",
+    }
+    local status = vgui.Create("DLabel", frame)
+    status:SetPos(12, 32)
+    status:SetSize(336, 18)
+    status:SetFont("RE4M_Tiny")
+    status:SetTextColor(Color(220, 200, 200))
+    status.Think = function(self)
+        self:SetText("State: " .. (stateNames[RE4M_CLIENT.GameState] or "?") ..
+            "    Theme: " .. tostring(RE4M_CLIENT.CurrentTheme))
+    end
+
+    local buttons = {
+        { "START MATCH",     function() SendAdminCommand("start") end },
+        { "END ROUND",       function() SendAdminCommand("stop") end },
+        { "RESTART MATCH",   function() SendAdminCommand("restart") end },
+        { "CLEAR ENEMIES",   function() SendAdminCommand("cleanup") end },
+        { "+30 SECONDS",     function() SendAdminCommand("add_time", function() net.WriteFloat(30) end) end },
+        { "REBUILD WEAPONS", function() SendAdminCommand("rebuild_weapons") end },
+    }
+    for i, data in ipairs(buttons) do
+        local btn = vgui.Create("DButton", frame)
+        btn:SetPos(12 + ((i - 1) % 2) * 172, 56 + math.floor((i - 1) / 2) * 40)
+        btn:SetSize(164, 34)
+        btn:SetText(data[1])
+        btn:SetFont("RE4M_Tiny")
+        btn:SetTextColor(Color(255, 255, 255))
+        btn.Paint = PaintAdminButton
+        btn.DoClick = data[2]
+    end
+
+    local cfg = RE4MERCS_GetConfig()
+    local npcSlider = vgui.Create("DNumSlider", frame)
+    npcSlider:SetPos(12, 184)
+    npcSlider:SetSize(336, 30)
+    npcSlider:SetText("Base max enemies")
+    npcSlider:SetMin(1)
+    npcSlider:SetMax(math.max(1, tonumber(cfg.AbsoluteMaxNPCs) or 40))
+    npcSlider:SetDecimals(0)
+    npcSlider:SetValue(tonumber(cfg.BaseMaxNPCs) or 18)
+    npcSlider:SetDark(false)
+    if IsValid(npcSlider.Label) then npcSlider.Label:SetTextColor(Color(255, 255, 255)) end
+
+    local applyNPCs = vgui.Create("DButton", frame)
+    applyNPCs:SetPos(12, 218)
+    applyNPCs:SetSize(336, 28)
+    applyNPCs:SetText("APPLY ENEMY LIMIT")
+    applyNPCs:SetFont("RE4M_Tiny")
+    applyNPCs:SetTextColor(Color(255, 255, 255))
+    applyNPCs.Paint = PaintAdminButton
+    applyNPCs.DoClick = function()
+        local value = math.floor(npcSlider:GetValue())
+        SendAdminCommand("set_max_npcs", function() net.WriteUInt(value, 16) end)
+    end
+
+    local hint = vgui.Create("DLabel", frame)
+    hint:SetPos(12, 256)
+    hint:SetSize(336, 64)
+    hint:SetFont("RE4M_Tiny")
+    hint:SetWrap(true)
+    hint:SetContentAlignment(7)
+    hint:SetTextColor(Color(190, 175, 175))
+    hint:SetText("Open anytime with !admin in chat or the re4m_adminpanel console command. " ..
+        "Themes and custom enemies are set on the lobby's MAP THEME tab.")
+end
+
+concommand.Add("re4m_adminpanel", function() RE4M_OpenAdminPanel() end, nil,
+    "Open the RE Mercenaries admin panel")
+
+-- ============================================
 -- THEME TAB (Admin Only)
 -- ============================================
 
@@ -1738,47 +1868,60 @@ function RE4M_CreateThemePanel(parent)
         return
     end
 
-    -- Theme selection
     local themePanel = vgui.Create("DPanel", parent)
     themePanel:SetPos(10, 10)
     themePanel:SetSize(pw - 20, ph - 20)
     themePanel.Paint = function(self, w, h)
         draw.RoundedBox(6, 0, 0, w, h, Color(30, 15, 15, 200))
-        draw.SimpleText("MAP THEME & ENEMIES", "RE4M_Medium", w/2, 10,
+        draw.SimpleText("MAP THEME & ENEMIES", "RE4M_Medium", w / 2, 10,
             Color(255, 60, 60), TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP)
     end
+
+    local adminBtn = vgui.Create("DButton", themePanel)
+    adminBtn:SetPos(pw - 20 - 190, 10)
+    adminBtn:SetSize(175, 28)
+    adminBtn:SetText("ADMIN PANEL")
+    adminBtn:SetFont("RE4M_Tiny")
+    adminBtn:SetTextColor(Color(255, 255, 255))
+    adminBtn.Paint = PaintAdminButton
+    adminBtn.DoClick = function() RE4M_OpenAdminPanel() end
 
     local themes = {
         {
             id = "default",
             name = "RESIDENT EVIL 4 ENEMIES",
-            desc = "Ganados galore!. \n The classic RE4 experience",
+            desc = "Ganados galore!\nThe classic RE4 experience.",
             color = Color(180, 40, 40),
         },
         {
             id = "re5",
             name = "RESIDENT EVIL 5 ENEMIES",
-            desc = "Manji have arrived!, The classic RE5 experience.\nNo additional addons required.",
+            desc = "Manji have arrived! The classic RE5 experience.\nNo additional addons required.",
             color = Color(255, 20, 50),
         },
         {
             id = "halflife",
             name = "HALF-LIFE 2 ENEMIES",
-            desc = "Zombies, Antlions, Headcrabs, and more.\nAll enemies are on the same team and won't fight each other.\nNo additional addons required.",
+            desc = "Zombies, Antlions, Headcrabs, and more.\nAll enemies are on the same team and won't fight each other.",
             color = Color(255, 150, 50),
         },
         {
             id = "custom",
             name = "CUSTOM ENEMIES",
-            desc = "Choose your own NextBots and NPCs from the Steam Workshop.\n NOT IMPLEMENTED YET, COMING SOON....",
+            desc = "Pick your own NPCs and NextBots below.\nAny spawnmenu NPC or installed NextBot works.",
             color = Color(50, 150, 255),
         },
     }
 
+    -- Two columns of theme cards. The old single column ran to y=435 while
+    -- the custom list started at y=360, so the two overlapped.
+    local innerW = pw - 60
+    local cardW = math.floor((innerW - 10) / 2)
+    local cardH = 78
     for i, theme in ipairs(themes) do
         local btn = vgui.Create("DButton", themePanel)
-        btn:SetPos(20, 50 + (i-1) * 100)
-        btn:SetSize(pw - 60, 85)
+        btn:SetPos(20 + ((i - 1) % 2) * (cardW + 10), 48 + math.floor((i - 1) / 2) * (cardH + 8))
+        btn:SetSize(cardW, cardH)
         btn:SetText("")
 
         btn.Paint = function(self, w, h)
@@ -1792,16 +1935,15 @@ function RE4M_CreateThemePanel(parent)
             if selected then
                 surface.SetDrawColor(theme.color)
                 surface.DrawOutlinedRect(0, 0, w, h, 3)
-                draw.SimpleText("✓", "RE4M_Large", w - 40, h/2, Color(255, 255, 255), TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+                draw.SimpleText("✓", "RE4M_Large", w - 36, h / 2, Color(255, 255, 255), TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
             end
 
-            draw.SimpleText(theme.name, "RE4M_Medium", 15, 10,
+            draw.SimpleText(theme.name, "RE4M_Medium", 15, 8,
                 Color(255, 255, 255), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
 
-            -- Draw description lines
             local lines = string.Explode("\n", theme.desc)
             for j, line in ipairs(lines) do
-                draw.SimpleText(line, "RE4M_Tiny", 15, 35 + (j-1) * 16,
+                draw.SimpleText(line, "RE4M_Tiny", 15, 38 + (j - 1) * 16,
                     Color(200, 200, 200, 180), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
             end
         end
@@ -1811,78 +1953,156 @@ function RE4M_CreateThemePanel(parent)
             net.Start("RE4M_SetTheme")
                 net.WriteString(theme.id)
             net.SendToServer()
-            surface.PlaySound("ui/btn_click.wav")
+            RE4M_PlayUISound("ui/btn_click.wav", "garrysmod/ui_click.wav")
         end
     end
 
-    -- Custom NPC list (only visible when custom theme is selected)
+    -- ===== Custom enemy editor =====
+    local customY = 48 + 2 * (cardH + 8) + 6
     local customPanel = vgui.Create("DPanel", themePanel)
-    customPanel:SetPos(20, 360)
-    customPanel:SetSize(pw - 60, ph - 380)
-
+    customPanel:SetPos(20, customY)
+    customPanel:SetSize(innerW, math.max(160, ph - 20 - customY - 12))
     customPanel.Paint = function(self, w, h)
-        if RE4M_CLIENT.CurrentTheme ~= "custom" then
-            self:SetVisible(false)
-            return
-        end
-        self:SetVisible(true)
         draw.RoundedBox(6, 0, 0, w, h, Color(20, 10, 10, 200))
-        draw.SimpleText("Custom NPC Classes", "RE4M_Small", w/2, 5,
+        draw.SimpleText("CUSTOM ENEMIES  (used by the Custom Enemies theme)", "RE4M_Small", w / 2, 5,
             Color(200, 200, 200), TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP)
     end
-
-    -- Text entry for adding NPC classes
-    local npcEntry = vgui.Create("DTextEntry", customPanel)
-    npcEntry:SetPos(10, 25)
-    npcEntry:SetSize(customPanel:GetWide() - 120, 25)
-    npcEntry:SetPlaceholderText("Enter NPC class name (e.g., npc_zombie)")
-    npcEntry:SetFont("RE4M_Small")
-    npcEntry.Paint = function(self, w, h)
-        draw.RoundedBox(4, 0, 0, w, h, Color(50, 30, 30, 220))
-        self:DrawTextEntryText(Color(255, 255, 255), Color(255, 100, 100), Color(255, 255, 255))
+    -- Visibility used to be toggled from inside Paint, and a hidden panel never
+    -- paints again, so the editor could never come back once hidden. Dim it
+    -- instead so the lists can be prepared before switching theme.
+    customPanel.Think = function(self)
+        self:SetAlpha(RE4M_CLIENT.CurrentTheme == "custom" and 255 or 120)
     end
 
-    local addBtn = vgui.Create("DButton", customPanel)
-    addBtn:SetPos(customPanel:GetWide() - 100, 25)
-    addBtn:SetSize(90, 25)
-    addBtn:SetText("Add NPC")
-    addBtn:SetFont("RE4M_Small")
-    addBtn:SetTextColor(Color(255, 255, 255))
-    addBtn.Paint = function(self, w, h)
-        draw.RoundedBox(4, 0, 0, w, h, self:IsHovered() and Color(50, 150, 50, 220) or Color(40, 100, 40, 200))
+    local cw = customPanel:GetWide()
+    local listData = { regular = {}, elite = {} }
+
+    local npcPicker = vgui.Create("DComboBox", customPanel)
+    npcPicker:SetPos(10, 30)
+    npcPicker:SetSize(cw - 330, 26)
+    npcPicker:SetValue("Choose a spawnmenu NPC...")
+    local npcChoices = {}
+    for name, data in pairs(list.Get("NPC")) do
+        npcChoices[#npcChoices + 1] = {
+            label = (data.Name or name) .. "  (" .. name .. ")",
+            value = name,
+            category = data.Category or "Other",
+        }
+    end
+    table.sort(npcChoices, function(a, b)
+        if a.category ~= b.category then return a.category < b.category end
+        return a.label < b.label
+    end)
+    for _, choice in ipairs(npcChoices) do
+        npcPicker:AddChoice("[" .. choice.category .. "] " .. choice.label, choice.value)
     end
 
-    -- Simple list of added NPCs
+    local classEntry = vgui.Create("DTextEntry", customPanel)
+    classEntry:SetPos(10, 60)
+    classEntry:SetSize(cw - 330, 26)
+    classEntry:SetPlaceholderText("...or type an entity class (e.g. npc_zombie, drg_roach_re4_ganado)")
+    classEntry:SetFont("RE4M_Tiny")
+
+    local typeBox = vgui.Create("DComboBox", customPanel)
+    typeBox:SetPos(cw - 310, 30)
+    typeBox:SetSize(110, 26)
+    typeBox:AddChoice("Regular", "regular", true)
+    typeBox:AddChoice("Elite", "elite")
+
     local npcList = vgui.Create("DListView", customPanel)
-    npcList:SetPos(10, 55)
-    npcList:SetSize(customPanel:GetWide() - 20, customPanel:GetTall() - 65)
-    npcList:AddColumn("Class Name"):SetWidth(300)
-    npcList:AddColumn("Type"):SetWidth(100)
-    npcList.Paint = function(self, w, h)
-        draw.RoundedBox(4, 0, 0, w, h, Color(20, 10, 10, 200))
-    end
+    npcList:SetPos(10, 92)
+    npcList:SetSize(cw - 20, customPanel:GetTall() - 102)
+    npcList:SetMultiSelect(false)
+    npcList:AddColumn("Class / NPC list name")
+    npcList:AddColumn("Type"):SetFixedWidth(100)
 
-    local customRegular = {}
-    local customElite = {}
-
-    addBtn.DoClick = function()
-        local class = npcEntry:GetValue()
-        if class and class ~= "" then
-            table.insert(customRegular, class)
-            npcList:AddLine(class, "Regular")
-            npcEntry:SetValue("")
-
-            -- Send to server
-            net.Start("RE4M_SetCustomNPCs")
-                net.WriteUInt(#customRegular, 8)
-                for _, c in ipairs(customRegular) do
-                    net.WriteString(c)
-                end
-                net.WriteUInt(#customElite, 8)
-                for _, c in ipairs(customElite) do
-                    net.WriteString(c)
-                end
-            net.SendToServer()
+    local function RefreshList()
+        npcList:Clear()
+        for _, kind in ipairs({ "regular", "elite" }) do
+            for _, class in ipairs(listData[kind]) do
+                local line = npcList:AddLine(class, kind == "elite" and "Elite" or "Regular")
+                line.NPCKind, line.NPCClass = kind, class
+            end
         end
     end
+
+    local function SendLists()
+        net.Start("RE4M_SetCustomNPCs")
+            for _, kind in ipairs({ "regular", "elite" }) do
+                local count = math.min(#listData[kind], 64)
+                net.WriteUInt(count, 8)
+                for i = 1, count do net.WriteString(listData[kind][i]) end
+            end
+        net.SendToServer()
+    end
+
+    -- The list used to start empty every time and could only grow; show
+    -- what the server actually has (it answers RE4M_RequestCustomNPCs).
+    local function LoadFromClientCache()
+        local cached = RE4M_CLIENT.CustomNPCs or {}
+        listData.regular = table.Copy(cached.regular or {})
+        listData.elite = table.Copy(cached.elite or {})
+        RefreshList()
+    end
+    LoadFromClientCache()
+    customPanel.LastRevision = RE4M_CLIENT.CustomNPCRevision or 0
+    npcList.Think = function()
+        local revision = RE4M_CLIENT.CustomNPCRevision or 0
+        if revision ~= customPanel.LastRevision then
+            customPanel.LastRevision = revision
+            LoadFromClientCache()
+        end
+    end
+    net.Start("RE4M_RequestCustomNPCs")
+    net.SendToServer()
+
+    local function MakeButton(label, x, y, w, color, onClick)
+        local btn = vgui.Create("DButton", customPanel)
+        btn:SetPos(x, y)
+        btn:SetSize(w, 26)
+        btn:SetText(label)
+        btn:SetFont("RE4M_Tiny")
+        btn:SetTextColor(Color(255, 255, 255))
+        btn.Paint = function(self, bw, bh)
+            draw.RoundedBox(4, 0, 0, bw, bh, self:IsHovered() and color or ColorAlpha(color, 170))
+        end
+        btn.DoClick = onClick
+        return btn
+    end
+
+    MakeButton("ADD", cw - 190, 30, 85, Color(50, 150, 50), function()
+        local class = string.Trim(classEntry:GetValue() or "")
+        if class == "" then
+            local _, selected = npcPicker:GetSelected()
+            class = selected or ""
+        end
+        if class == "" then return end
+        local _, kind = typeBox:GetSelected()
+        kind = kind or "regular"
+        if table.HasValue(listData[kind], class) then return end
+        if #listData[kind] >= 64 then
+            notification.AddLegacy("Each list holds at most 64 enemies.", NOTIFY_ERROR, 3)
+            return
+        end
+        table.insert(listData[kind], class)
+        classEntry:SetValue("")
+        RefreshList()
+        SendLists()
+        RE4M_PlayUISound("ui/btn_click.wav", "garrysmod/ui_click.wav")
+    end)
+
+    MakeButton("REMOVE", cw - 100, 30, 90, Color(170, 50, 50), function()
+        local _, line = npcList:GetSelectedLine()
+        if not IsValid(line) then return end
+        table.RemoveByValue(listData[line.NPCKind], line.NPCClass)
+        RefreshList()
+        SendLists()
+        RE4M_PlayUISound("ui/btn_click.wav", "garrysmod/ui_click.wav")
+    end)
+
+    MakeButton("CLEAR ALL", cw - 310, 60, 110, Color(120, 60, 60), function()
+        listData.regular, listData.elite = {}, {}
+        RefreshList()
+        SendLists()
+    end)
 end

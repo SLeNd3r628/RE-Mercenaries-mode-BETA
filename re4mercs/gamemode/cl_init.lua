@@ -6,6 +6,8 @@ include("cl_menu.lua")
 include("cl_music.lua")
 include("cl_results.lua")
 include("cl_camera_movement.lua")
+include("cl_roll.lua")
+include("cl_hudblock.lua")
 
 -- ============================================
 -- CLIENT STATE
@@ -266,9 +268,50 @@ net.Receive("RE4M_WeaponList", function()
     local json = util.JSONToTable(decompressed)
     if json then
         RE4M_CLIENT.WeaponList = json
+        RE4M_RestoreSavedLoadout()
     else
         ErrorNoHalt("[RE4 Mercs] RE4M_WeaponList: Failed to parse weapon JSON!\n")
     end
+end)
+
+--- Re-select the loadout saved in re4m_loadout. The loadout used to be
+--- forgotten on every reconnect/map change, silently falling back to the
+--- default HL2 pistol/SMG/crowbar kit.
+function RE4M_RestoreSavedLoadout()
+    local cvar = GetConVar("re4m_loadout")
+    if not cvar then return end
+    local saved = cvar:GetString()
+    if saved == "" then return end
+
+    local byClass = {}
+    for _, wep in ipairs(RE4M_CLIENT.WeaponList or {}) do
+        byClass[wep.class] = wep
+    end
+
+    local cfg = RE4MERCS_GetConfig()
+    local maxSlots = cfg and cfg.MaxWeaponSlots or 3
+    local restored = {}
+    for class in string.gmatch(saved, "([^,]+)") do
+        if byClass[class] and #restored < maxSlots then
+            restored[#restored + 1] = byClass[class]
+        end
+    end
+    if #restored == 0 then return end
+
+    RE4M_CLIENT.SelectedLoadout = restored
+    if RE4M_SendLoadout then RE4M_SendLoadout() end
+end
+
+RE4M_CLIENT.CustomNPCs = { regular = {}, elite = {} }
+
+net.Receive("RE4M_CustomNPCList", function()
+    local function ReadList()
+        local list = {}
+        for i = 1, net.ReadUInt(8) do list[#list + 1] = net.ReadString() end
+        return list
+    end
+    RE4M_CLIENT.CustomNPCs = { regular = ReadList(), elite = ReadList() }
+    RE4M_CLIENT.CustomNPCRevision = (RE4M_CLIENT.CustomNPCRevision or 0) + 1
 end)
 
 net.Receive("RE4M_ScoreUpdate", function()
@@ -317,10 +360,12 @@ end)
 
 net.Receive("RE4M_PickupCollected", function()
     local pickupType = net.ReadString()
+    local ammoLabel = pickupType == "ammo" and net.BytesLeft() > 0 and net.ReadString() or nil
+    if pickupType == "health" and RE4M_FlashVignette then RE4M_FlashVignette("herb") end
 
     local names = {
         health       = "HEALTH RECOVERED",
-        ammo         = "AMMO AQUIRED",
+        ammo         = "AMMO ACQUIRED",
         time         = "TIME EXTENDED",
         rare_rpg     = "★ RARE DROP: RPG ROUND ★",
         rare_grenade = "★ RARE DROP: GRENADE ★",
@@ -335,11 +380,75 @@ net.Receive("RE4M_PickupCollected", function()
     }
 
     table.insert(RE4M_CLIENT.PickupNotifs, {
-        text  = names[pickupType] or "PICKUP",
+        text  = pickupType == "ammo" and
+            ((ammoLabel and ammoLabel ~= "" and ammoLabel or "AMMO") .. " ACQUIRED") or
+            (names[pickupType] or "PICKUP"),
         type  = typeColors[pickupType] or "ammo",
         time  = CurTime(),
         alpha = 255,
     })
+end)
+
+-- RE4-style pickup markers: camera-facing textured quads using the addon beam
+-- material, with width/alpha tuned by distance like the reference drop system.
+local re4mPickupBeamMaterial = Material("re4beam/beam")
+local re4mPickupBeamClasses = {"re_ammopickup", "re_greenherb", "re_timepickup"}
+
+hook.Add("PreDrawHalos", "RE4M_PickupHalos", function()
+    local healthPickups, ammoPickups = {}, {}
+    for _, className in ipairs(re4mPickupBeamClasses) do
+        for _, ent in ipairs(ents.FindByClass(className)) do
+            if not IsValid(ent) then continue end
+            local category = ent:GetNW2String("RE_LootCategory", "")
+            if category == "ammo" then
+                ammoPickups[#ammoPickups + 1] = ent
+            elseif category == "health" or category == "time" then
+                healthPickups[#healthPickups + 1] = ent
+            end
+        end
+    end
+
+    if #healthPickups > 0 then halo.Add(healthPickups, Color(150, 255, 150), 2, 2, 1, true, true) end
+    if #ammoPickups > 0 then halo.Add(ammoPickups, Color(255, 160, 160), 2, 2, 1, true, true) end
+end)
+
+hook.Add("PostDrawTranslucentRenderables", "RE4M_PickupBeams", function(depth, skybox)
+    if depth or skybox then return end
+    local ply = LocalPlayer()
+    if not IsValid(ply) then return end
+
+    local up = Vector(0, 0, 1)
+    for _, className in ipairs(re4mPickupBeamClasses) do
+        for _, ent in ipairs(ents.FindByClass(className)) do
+            if not IsValid(ent) then continue end
+            local category = ent:GetNW2String("RE_LootCategory", "")
+            if category == "" then continue end
+
+            local entityPos = ent:GetPos()
+            local dist = ply:GetPos():Distance(entityPos)
+            local width = math.Clamp(math.Remap(dist, 500, 1500, 3, 12), 3, 12)
+            local alpha = math.Clamp(math.Remap(dist, 130, 170, 0, 255), 0, 255)
+            local color = category == "ammo"
+                and Color(255, 145, 145, alpha)
+                or Color(175, 255, 175, alpha)
+
+            local pos = entityPos + Vector(0, 0, 20)
+            local toPlayer = ply:GetPos() - pos
+            toPlayer.z = 0
+            if toPlayer:LengthSqr() < 0.001 then toPlayer = Vector(1, 0, 0) end
+            local right = toPlayer:GetNormalized():Cross(up):GetNormalized()
+            local height = 40
+
+            render.SetMaterial(re4mPickupBeamMaterial)
+            render.DrawQuad(
+                pos + up * height + right * width,
+                pos + up * height - right * width,
+                pos - up * height - right * width,
+                pos - up * height + right * width,
+                color
+            )
+        end
+    end
 end)
 
 net.Receive("RE4M_TimeExtend", function()
@@ -418,6 +527,12 @@ net.Receive("RE4M_DamageNumber", function()
     local willKill  = net.ReadBool()
     local targetEnt = net.ReadEntity()
 
+    -- The re4m_showdamagenumbers / maxdamagenumbers / *lifetime ConVars
+    -- existed but the values here were hard-coded.
+    local cfg = RE4MERCS_GetConfig()
+    if not cfg.ShowDamageNumbers then return end
+    local maxNumbers = math.max(1, tonumber(cfg.MaxDamageNumbers) or 30)
+
     local randomOffset = Vector(
         math.Rand(-30, 30),
         math.Rand(-30, 30),
@@ -437,10 +552,11 @@ net.Receive("RE4M_DamageNumber", function()
                          math.Rand(-20, 20),
                          math.Rand(40, 80)
                      ),
-        lifetime   = (isHeadshot and 1.5 or 1.0),
+        lifetime   = isHeadshot and (tonumber(cfg.HeadshotNumberLifetime) or 1.5)
+                                 or (tonumber(cfg.DamageNumberLifetime) or 1.0),
     })
 
-    while #RE4M_CLIENT.DamageNumbers > 30 do
+    while #RE4M_CLIENT.DamageNumbers > maxNumbers do
         table.remove(RE4M_CLIENT.DamageNumbers, 1)
     end
 end)
@@ -456,6 +572,10 @@ net.Receive("RE4M_EnemyKilled", function()
     local isElite   = net.ReadBool()
     local attacker  = net.ReadEntity()
 
+    local cfg = RE4MERCS_GetConfig()
+    if not cfg.ShowKillScores then return end
+    local maxFloats = math.max(1, tonumber(cfg.MaxKillScoreFloats) or 15)
+
     table.insert(RE4M_CLIENT.KillScoreFloats, {
         pos       = deathPos + Vector(0, 0, 60),
         score     = score,
@@ -466,7 +586,7 @@ net.Receive("RE4M_EnemyKilled", function()
         attacker  = IsValid(attacker) and attacker or nil,
     })
 
-    while #RE4M_CLIENT.KillScoreFloats > 15 do
+    while #RE4M_CLIENT.KillScoreFloats > maxFloats do
         table.remove(RE4M_CLIENT.KillScoreFloats, 1)
     end
 end)
@@ -479,9 +599,25 @@ net.Receive("RE4M_EliteSpawned", function()
     local className = net.ReadString()
     local spawnPos  = net.ReadVector()
 
+    local cfg = RE4MERCS_GetConfig()
+    if not cfg.ShowEliteAlerts then return end
+
+    -- Show the enemy's display name ("Garrador") rather than its raw class
+    -- ("DRG_ROACH_RE4_GARRADOR") when the entity or NPC list provides one.
+    local displayName = className
+    local stored = scripted_ents.GetStored(className)
+    if stored and stored.t and isstring(stored.t.PrintName) and stored.t.PrintName ~= "" then
+        displayName = stored.t.PrintName
+    elseif list.Get("NPC")[className] and list.Get("NPC")[className].Name then
+        displayName = list.Get("NPC")[className].Name
+    end
+    if isstring(displayName) and string.StartWith(displayName, "#") then
+        displayName = language.GetPhrase(string.sub(displayName, 2))
+    end
+
     table.insert(RE4M_CLIENT.EliteAlerts, {
         text     = "⚠ ELITE ENEMY DETECTED ⚠",
-        subtext  = string.upper(className or "UNKNOWN"),
+        subtext  = string.upper(displayName or "UNKNOWN"),
         time     = CurTime(),
         alpha    = 255,
         duration = 4,
@@ -543,22 +679,34 @@ end)
 -- Parry System
 -- =============================================
 
-local nextAttempt = 0
-local parryKnife = nil
+local nextDoorKickAttempt = 0
 local KNIFE_MODEL = "models/weapons/w_knife_t.mdl"
 local originalTPIK = nil          -- stores original arc9_tpik value
 
-concommand.Add("re4m_parry", function()
-    if RE4M_CLIENT.GameState ~= GAMESTATE_ACTIVE then return end
-    if nextAttempt > CurTime() then return end
+local function RE4M_DisableTPIKForAction()
+    local tpikCvar = GetConVar("arc9_tpik")
+    if not tpikCvar then return end
 
-    local cfg = RE4MERCS_GetConfig and RE4MERCS_GetConfig()
-    if cfg and cfg.ParryEnabled == false then return end
+    if originalTPIK == nil then originalTPIK = tpikCvar:GetInt() end
+    RunConsoleCommand("arc9_tpik", "0")
 
-    nextAttempt = CurTime() + 0.25
-    net.Start("RE4M_ParryRequest")
-    net.SendToServer()
-end)
+    hook.Add("Think", "RE4M_RestoreActionTPIK", function()
+        local ply = LocalPlayer()
+        local parryActive = IsValid(ply) and ply:GetNW2Float("RE4M_ParryTime", 0) > CurTime()
+        local counterActive = IsValid(ply) and ply:GetNW2Float("RE4M_CounterTime", 0) > CurTime()
+        if parryActive or counterActive then return end
+
+        hook.Remove("Think", "RE4M_RestoreActionTPIK")
+        if originalTPIK ~= nil then
+            RunConsoleCommand("arc9_tpik", tostring(originalTPIK))
+            originalTPIK = nil
+        end
+    end)
+end
+
+-- Remove legacy standalone binds; parry and counter now share the USE key.
+concommand.Remove("re4m_parry")
+concommand.Remove("re4m_counter")
 
 net.Receive("RE4M_ParryHit", function()
     local pos = net.ReadVector()
@@ -577,87 +725,261 @@ net.Receive("RE4M_ParryHit", function()
     util.Effect("cball_explode", flash)
 end)
 
+-- One temporary knife per parrying player. The server now broadcasts the
+-- parry with the player entity, so teammates see the knife too (previously
+-- only the parrying player got the message).
+local parryKnives = {}
+
+local function RE4M_RemoveParryKnife(ply)
+    local knife = parryKnives[ply]
+    if IsValid(knife) then knife:Remove() end
+    parryKnives[ply] = nil
+    if IsValid(ply) then
+        local wep = ply:GetActiveWeapon()
+        if IsValid(wep) then wep:SetNoDraw(false) end
+    end
+end
+
 net.Receive("RE4M_PlayParryAnim", function()
-    local ply = LocalPlayer()
+    local ply = net.ReadEntity()
     if not IsValid(ply) then return end
 
     ply:AnimRestartMainSequence()
 
     -- Force ARC9 third-person IK off so arms don't bug
-    local tpikCvar = GetConVar("arc9_tpik")
-    if tpikCvar then
-        originalTPIK = tpikCvar:GetInt()
-        RunConsoleCommand("arc9_tpik", "0")
-    end
+    if ply == LocalPlayer() then RE4M_DisableTPIKForAction() end
 
-    -- Create the temporary knife model
-    if IsValid(parryKnife) then
-        parryKnife:Remove()
-    end
+    RE4M_RemoveParryKnife(ply)
+    local knife = ClientsideModel(KNIFE_MODEL)
+    if not IsValid(knife) then return end
+    knife:SetNoDraw(false)
+    parryKnives[ply] = knife
+end)
 
-    parryKnife = ClientsideModel(KNIFE_MODEL)
-    if not IsValid(parryKnife) then return end
-
-    parryKnife:SetNoDraw(false)
-    parryKnife:SetOwner(ply)
-
-    local bone = ply:LookupBone("ValveBiped.Bip01_R_Hand") or 0
-
-    -- Keep knife positioned + hide the real gun
-    hook.Add("Think", "RE4M_ParryKnifeThink", function()
-        if not IsValid(ply) then
-            hook.Remove("Think", "RE4M_ParryKnifeThink")
-            if IsValid(parryKnife) then parryKnife:Remove() end
-            return
+-- Keep each knife in its player's hand and hide the real gun while parrying.
+hook.Add("Think", "RE4M_ParryKnifeThink", function()
+    for ply, knife in pairs(parryKnives) do
+        if not IsValid(ply) or not IsValid(knife) or ply:GetNW2Float("RE4M_ParryTime", 0) <= CurTime() then
+            RE4M_RemoveParryKnife(ply)
+            continue
         end
 
-        local parryEnd = ply:GetNW2Float("RE4M_ParryTime", 0)
-        if parryEnd <= CurTime() then
-            -- Parry finished – clean up
-            hook.Remove("Think", "RE4M_ParryKnifeThink")
-
-            if IsValid(parryKnife) then
-                parryKnife:Remove()
-                parryKnife = nil
-            end
-
-            -- Restore original weapon visibility
-            local wep = ply:GetActiveWeapon()
-            if IsValid(wep) then
-                wep:SetNoDraw(false)
-            end
-
-            -- Restore ARC9 TPIK
-            if originalTPIK ~= nil then
-                RunConsoleCommand("arc9_tpik", tostring(originalTPIK))
-                originalTPIK = nil
-            end
-            return
-        end
-
-        -- Hide the real gun so only the knife is visible
         local wep = ply:GetActiveWeapon()
-        if IsValid(wep) then
-            wep:SetNoDraw(true)
+        if IsValid(wep) then wep:SetNoDraw(true) end
+
+        local bone = ply:LookupBone("ValveBiped.Bip01_R_Hand")
+        local matrix = bone and ply:GetBoneMatrix(bone)
+        if matrix then
+            local pos = matrix:GetTranslation()
+            local ang = matrix:GetAngles()
+
+            -- Adjust these if the knife sits wrong
+            pos = pos + ang:Forward() * 3 + ang:Right() * 1.5 + ang:Up() * -1
+            ang:RotateAroundAxis(ang:Right(), 90)
+            ang:RotateAroundAxis(ang:Up(), 180)
+
+            knife:SetPos(pos)
+            knife:SetAngles(ang)
         end
+    end
+end)
 
-        -- Position the knife in the hand
-        if IsValid(parryKnife) and bone then
-            local matrix = ply:GetBoneMatrix(bone)
-            if matrix then
-                local pos = matrix:GetTranslation()
-                local ang = matrix:GetAngles()
+net.Receive("RE4M_PlayCounterAnim", function()
+    local ply = net.ReadEntity()
+    if IsValid(ply) then
+        ply:SetCycle(0)
+        ply:AnimRestartMainSequence()
+    end
 
-                -- Adjust these if the knife sits wrong
-                pos = pos + ang:Forward() * 3 + ang:Right() * 1.5 + ang:Up() * -1
-                ang:RotateAroundAxis(ang:Right(), 90)
-                ang:RotateAroundAxis(ang:Up(), 180)
+    -- ARC9's third-person IK can interfere with the counter animation pose.
+    if IsValid(ply) and ply == LocalPlayer() then RE4M_DisableTPIKForAction() end
+end)
 
-                parryKnife:SetPos(pos)
-                parryKnife:SetAngles(ang)
+net.Receive("RE4M_PlayDoorKick", function()
+    local ply = net.ReadEntity()
+    if IsValid(ply) then
+        ply:SetCycle(0)
+        ply:AnimRestartMainSequence()
+    end
+end)
+
+local function RE4M_ClientFindKickDoor(maxRange)
+    local ply = LocalPlayer()
+    if not IsValid(ply) then return end
+
+    local eyePos = ply:EyePos()
+    local trace = util.TraceLine({
+        start = eyePos,
+        endpos = eyePos + ply:GetAimVector() * maxRange,
+        filter = ply,
+        mask = MASK_SOLID,
+    })
+    local door = trace.Entity
+    if not IsValid(door) then return end
+    local class = door:GetClass()
+    if class ~= "prop_door_rotating" and class ~= "func_door" and class ~= "func_door_rotating" then return end
+    if door:MapCreationID() == -1 or door:GetNW2Bool("RE4M_KickedOpen", false) then return end
+    if eyePos:DistToSqr(door:WorldSpaceCenter()) > maxRange * maxRange then return end
+    return door
+end
+
+local RE4M_CLIENT_USE_PICKUPS = {
+    re_ammopickup = true,
+    re_greenherb = true,
+    re_timepickup = true,
+}
+
+local function RE4M_ClientFindUsePickup()
+    local ply = LocalPlayer()
+    if not IsValid(ply) then return end
+
+    local viewOrigin, direction
+    if RE4M_GetCameraAimRay then
+        viewOrigin, direction = RE4M_GetCameraAimRay()
+    end
+    viewOrigin = isvector(viewOrigin) and viewOrigin or ply:EyePos()
+    direction = isvector(direction) and direction:GetNormalized() or ply:GetAimVector()
+    local maxPickupRange = 220
+    local viewRange = maxPickupRange + math.min(viewOrigin:Distance(ply:GetPos()), 160)
+    local traceFilter = {ply}
+    local activeWeapon = ply:GetActiveWeapon()
+    if IsValid(activeWeapon) then traceFilter[#traceFilter + 1] = activeWeapon end
+    local directTrace = util.TraceLine({
+        start = viewOrigin,
+        endpos = viewOrigin + direction * viewRange,
+        filter = traceFilter,
+        mask = MASK_SOLID,
+    })
+    local direct = directTrace.Entity
+    if IsValid(direct) and RE4M_CLIENT_USE_PICKUPS[direct:GetClass()] and
+       ply:GetPos():DistToSqr(direct:WorldSpaceCenter()) <= maxPickupRange * maxPickupRange then
+        return direct
+    end
+
+    -- Give the three small RE4 pickups a generous aim-assist volume so the
+    -- third-person camera does not require pixel-perfect USE targeting.
+    local best, bestDistance
+    for _, ent in ipairs(ents.FindInSphere(ply:GetPos(), maxPickupRange)) do
+        if not IsValid(ent) or not RE4M_CLIENT_USE_PICKUPS[ent:GetClass()] then continue end
+        local offset = ent:WorldSpaceCenter() - viewOrigin
+        local alongRay = offset:Dot(direction)
+        if alongRay < 0 or alongRay > viewRange then continue end
+
+        local perpendicular = offset - direction * alongRay
+        local distanceSqr = perpendicular:LengthSqr()
+        local aimRadius = ent:GetClass() == "re_greenherb" and 96 or 80
+        if distanceSqr > aimRadius * aimRadius then continue end
+        if bestDistance and distanceSqr >= bestDistance then continue end
+
+        local visibilityFilter = {ply, ent}
+        if IsValid(activeWeapon) then visibilityFilter[#visibilityFilter + 1] = activeWeapon end
+        local visibility = util.TraceLine({
+            start = viewOrigin,
+            endpos = ent:WorldSpaceCenter(),
+            filter = visibilityFilter,
+            mask = MASK_SOLID,
+        })
+        if visibility.Hit then continue end
+
+        best = ent
+        bestDistance = distanceSqr
+    end
+    return best
+end
+
+local nextUsePromptScan = 0
+local cachedUsePromptPickup
+
+local function RE4M_UpdateUsePromptTargets()
+    if nextUsePromptScan > CurTime() then
+        return cachedUsePromptPickup
+    end
+
+    nextUsePromptScan = CurTime() + 0.12
+    cachedUsePromptPickup = RE4M_ClientFindUsePickup()
+    return cachedUsePromptPickup
+end
+
+local function RE4M_ClientCanParry()
+    local ply = LocalPlayer()
+    if not IsValid(ply) then return false end
+    local cfg = RE4MERCS_GetConfig and RE4MERCS_GetConfig()
+    if not cfg or cfg.ParryEnabled == false then return false end
+    local range = cfg.ParryRange or 120
+    for _, ent in ipairs(ents.FindInSphere(ply:GetPos(), range)) do
+        local isVJ = IsValid(ent) and ent.IsVJBaseSNPC == true
+        if not IsValid(ent) or not (isVJ or ent.IsDrGNextbot or (ent.IsNextBot and ent:IsNextBot())) then continue end
+        if not isVJ and not ent.Parryable then continue end
+        local attacking = ent.IsAttacking and isfunction(ent.IsAttacking) and ent:IsAttacking()
+        if not attacking then
+            local sequence = string.lower(ent:GetSequenceName(ent:GetSequence()) or "")
+            attacking = (string.find(sequence, "att", 1, true) ~= nil or string.find(sequence, "melee", 1, true) ~= nil) and
+                not string.find(sequence, "grab", 1, true) and not string.find(sequence, "idle", 1, true)
+        end
+        if attacking then return true end
+    end
+    return false
+end
+
+local function RE4M_ClientFindCounterTarget()
+    local ply = LocalPlayer()
+    if not IsValid(ply) or not RE4M_IsCounterStunned then return end
+    local cfg = RE4MERCS_GetConfig and RE4MERCS_GetConfig()
+    if not cfg or cfg.CounterEnabled == false then return end
+    local range = cfg.CounterRange or cfg.ParryRange or 120
+    local best, bestDistance
+    for _, ent in ipairs(ents.FindInSphere(ply:GetPos(), range)) do
+        local isNextBot = IsValid(ent) and (ent.IsDrGNextbot or ent.IsVJBaseSNPC or (ent.IsNextBot and ent:IsNextBot()))
+        if not isNextBot or not RE4M_IsCounterStunned(ent) or ent:GetNW2Float("RE4M_CounteredUntil", 0) > CurTime() then continue end
+        local distance = ply:GetPos():DistToSqr(ent:GetPos())
+        if not bestDistance or distance < bestDistance then best, bestDistance = ent, distance end
+    end
+    return best
+end
+
+hook.Add("PlayerBindPress", "RE4M_DoorKickUseBind", function(ply, bind, pressed)
+    if not IsValid(ply) or ply ~= LocalPlayer() or RE4M_CLIENT.GameState ~= GAMESTATE_ACTIVE then return end
+    if not string.find(string.lower(bind or ""), "+use", 1, true) then return end
+    if ply:GetNW2Float("RE4M_ParryTime", 0) > CurTime() or
+       ply:GetNW2Float("RE4M_CounterTime", 0) > CurTime() or
+       ply:GetNW2Float("RE4M_DoorKickTime", 0) > CurTime() or
+       ply:GetNW2Float("RE4M_RollEndTime", 0) > CurTime() then return true end
+
+    local pickup = RE4M_ClientFindUsePickup()
+    if pickup then
+        if pressed and nextDoorKickAttempt <= CurTime() then
+            nextDoorKickAttempt = CurTime() + 0.25
+            local viewOrigin = ply:EyePos()
+            if RE4M_GetCameraAimRay then
+                local cameraOrigin = select(1, RE4M_GetCameraAimRay())
+                if isvector(cameraOrigin) then viewOrigin = cameraOrigin end
             end
+            net.Start("RE4M_UsePickupRequest")
+                net.WriteEntity(pickup)
+                net.WriteVector(viewOrigin)
+            net.SendToServer()
         end
-    end)
+        return true
+    end
+
+    if pressed and RE4M_ClientFindCounterTarget() then
+        net.Start("RE4M_CounterRequest")
+        net.SendToServer()
+        return true
+    end
+
+    if pressed and RE4M_ClientCanParry() then
+        net.Start("RE4M_ParryRequest")
+        net.SendToServer()
+        return true
+    end
+
+    if pressed and nextDoorKickAttempt <= CurTime() then
+        nextDoorKickAttempt = CurTime() + 0.25
+        net.Start("RE4M_DoorKickRequest")
+        net.SendToServer()
+    end
+    return true
 end)
 
 -- ============================================
@@ -665,7 +987,9 @@ end)
 -- ============================================
 hook.Add("SetupMove", "RE4M_ParryLockMovement", function(ply, mv, cmd)
     local parryEnd = ply:GetNW2Float("RE4M_ParryTime", 0)
-    if parryEnd > CurTime() then
+    local counterEnd = ply:GetNW2Float("RE4M_CounterTime", 0)
+    local doorKickEnd = ply:GetNW2Float("RE4M_DoorKickTime", 0)
+    if parryEnd > CurTime() or counterEnd > CurTime() or doorKickEnd > CurTime() then
         mv:SetForwardSpeed(0)
         mv:SetSideSpeed(0)
         mv:SetUpSpeed(0)
@@ -673,45 +997,21 @@ hook.Add("SetupMove", "RE4M_ParryLockMovement", function(ply, mv, cmd)
     end
 end)
 
--- ============================================
--- Forced third person during parry
--- ============================================
-hook.Add("CalcView", "RE4M_ParryThirdPerson", function(ply, pos, angles, fov)
-    if not IsValid(ply) or ply ~= LocalPlayer() then return end
-
-    local parryEnd = ply:GetNW2Float("RE4M_ParryTime", 0)
-    if parryEnd <= CurTime() then return end
-
-    local view = {}
-    view.origin = pos - angles:Forward() * 70 + angles:Up() * 12
-    view.angles = angles
-    view.fov    = fov
-
-    local tr = util.TraceLine({
-        start  = pos,
-        endpos = view.origin,
-        filter = ply,
-        mask   = MASK_SOLID_BRUSHONLY,
-    })
-    if tr.Hit then
-        view.origin = tr.HitPos + tr.HitNormal * 2
-    end
-
-    return view
-end)
-
 -- Hide first-person viewmodel
 hook.Add("PreDrawViewModel", "RE4M_ParryHideViewmodel", function(vm, ply, wep)
     local parryEnd = ply:GetNW2Float("RE4M_ParryTime", 0)
-    if parryEnd > CurTime() then
+    local counterEnd = ply:GetNW2Float("RE4M_CounterTime", 0)
+    local doorKickEnd = ply:GetNW2Float("RE4M_DoorKickTime", 0)
+    local rollEnd = ply:GetNW2Float("RE4M_RollEndTime", 0)
+    if parryEnd > CurTime() or counterEnd > CurTime() or doorKickEnd > CurTime() or rollEnd > CurTime() then
         return true
     end
 end)
 
 -- Draw the local player model in third person
 hook.Add("ShouldDrawLocalPlayer", "RE4M_ParryShowThirdPersonModel", function(ply)
-    local parryEnd = ply:GetNW2Float("RE4M_ParryTime", 0)
-    return parryEnd > CurTime()
+    local actionEnd = math.max(ply:GetNW2Float("RE4M_ParryTime", 0), ply:GetNW2Float("RE4M_CounterTime", 0), ply:GetNW2Float("RE4M_DoorKickTime", 0), ply:GetNW2Float("RE4M_RollEndTime", 0))
+    return actionEnd > CurTime()
 end)
 
 -- ============================================
@@ -729,31 +1029,8 @@ hook.Add("HUDPaint", "RE4M_ParryQTE", function()
     local cfg = RE4MERCS_GetConfig and RE4MERCS_GetConfig()
     if not cfg or cfg.ParryEnabled == false then return end
 
-    local range = cfg.ParryRange or 120
-    local showPrompt = false
-
-    for _, ent in ipairs(ents.FindInSphere(ply:GetPos(), range)) do
-        if not IsValid(ent) then continue end
-        if not (ent.IsDrGNextbot or ent:IsNextBot()) then continue end
-        if not ent.Parryable then continue end
-
-        local attacking = false
-        if ent.IsAttacking and isfunction(ent.IsAttacking) and ent:IsAttacking() then
-            attacking = true
-        else
-            local seqName = string.lower(ent:GetSequenceName(ent:GetSequence()) or "")
-            if string.find(seqName, "att") and not string.find(seqName, "grab") and not string.find(seqName, "idle") then
-                attacking = true
-            end
-        end
-
-        if attacking then
-            showPrompt = true
-            break
-        end
-    end
-
-    if not showPrompt then return end
+    local promptPickup = RE4M_UpdateUsePromptTargets()
+    if promptPickup or RE4M_ClientFindCounterTarget() or not RE4M_ClientCanParry() then return end
 
     local sw, sh = ScrW(), ScrH()
     local alpha = 180 + math.sin(CurTime() * 8) * 75   -- gentle pulse
@@ -763,9 +1040,78 @@ hook.Add("HUDPaint", "RE4M_ParryQTE", function()
     surface.DrawRect(sw / 2 - 140, sh * 0.72, 280, 42)
 
     -- Text
-    draw.SimpleText("PARRY  [ G ]", "RE4M_Medium",
+    local binding = input.LookupBinding("+use") or "E"
+    draw.SimpleText("PARRY  [ " .. string.upper(binding) .. " ]", "RE4M_Medium",
         sw / 2, sh * 0.72 + 21,
         Color(255, 220, 80, alpha),
+        TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+end)
+
+hook.Add("HUDPaint", "RE4M_CounterPrompt", function()
+    if RE4M_CLIENT.GameState ~= GAMESTATE_ACTIVE then return end
+    local ply = LocalPlayer()
+    if not IsValid(ply) or not ply:Alive() then return end
+    local promptPickup = RE4M_UpdateUsePromptTargets()
+    if promptPickup then return end
+    if ply:GetNW2Float("RE4M_ParryTime", 0) > CurTime() or
+       ply:GetNW2Float("RE4M_CounterTime", 0) > CurTime() then return end
+
+    local cfg = RE4MERCS_GetConfig and RE4MERCS_GetConfig()
+    if not cfg or cfg.CounterEnabled == false then return end
+
+    if not RE4M_ClientFindCounterTarget() then return end
+
+    local binding = input.LookupBinding("+use") or "E"
+    local label = "COUNTER  [ " .. string.upper(binding) .. " ]"
+    local sw, sh = ScrW(), ScrH()
+    local alpha = 180 + math.sin(CurTime() * 8) * 75
+    surface.SetDrawColor(0, 0, 0, alpha * 0.6)
+    surface.DrawRect(sw / 2 - 160, sh * 0.66, 320, 42)
+    draw.SimpleText(label, "RE4M_Medium", sw / 2, sh * 0.66 + 21,
+        Color(255, 170, 80, alpha), TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+end)
+
+hook.Add("HUDPaint", "RE4M_DoorKickPrompt", function()
+    if RE4M_CLIENT.GameState ~= GAMESTATE_ACTIVE then return end
+    local ply = LocalPlayer()
+    if not IsValid(ply) or not ply:Alive() then return end
+    if ply:GetNW2Float("RE4M_ParryTime", 0) > CurTime() or
+       ply:GetNW2Float("RE4M_CounterTime", 0) > CurTime() or
+       ply:GetNW2Float("RE4M_DoorKickTime", 0) > CurTime() then return end
+    local promptPickup = RE4M_UpdateUsePromptTargets()
+    if promptPickup then return end
+
+    local cfg = RE4MERCS_GetConfig and RE4MERCS_GetConfig()
+    local door = RE4M_ClientFindKickDoor((cfg and cfg.DoorKickRange) or 100)
+    if not IsValid(door) then return end
+
+    local binding = input.LookupBinding("+use") or "E"
+    local label = "OPEN  [ " .. string.upper(binding) .. " ]"
+    local sw, sh = ScrW(), ScrH()
+    local alpha = 180 + math.sin(CurTime() * 8) * 75
+    surface.SetDrawColor(0, 0, 0, alpha * 0.6)
+    surface.DrawRect(sw / 2 - 150, sh * 0.72, 300, 42)
+    draw.SimpleText(label, "RE4M_Medium", sw / 2, sh * 0.72 + 21,
+        Color(255, 220, 80, alpha), TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+end)
+
+hook.Add("HUDPaint", "RE4M_PickupUsePrompt", function()
+    if RE4M_CLIENT.GameState ~= GAMESTATE_ACTIVE then return end
+    local ply = LocalPlayer()
+    if not IsValid(ply) or not ply:Alive() then return end
+    if ply:GetNW2Float("RE4M_ParryTime", 0) > CurTime() or
+       ply:GetNW2Float("RE4M_CounterTime", 0) > CurTime() or
+       ply:GetNW2Float("RE4M_DoorKickTime", 0) > CurTime() then return end
+    local pickup = RE4M_UpdateUsePromptTargets()
+    if not pickup then return end
+
+    local binding = input.LookupBinding("+use") or "E"
+    local sw, sh = ScrW(), ScrH()
+    local alpha = 180 + math.sin(CurTime() * 8) * 75
+    surface.SetDrawColor(0, 0, 0, alpha * 0.6)
+    surface.DrawRect(sw / 2 - 145, sh * 0.72, 290, 42)
+    draw.SimpleText("TAKE  [ " .. string.upper(binding) .. " ]", "RE4M_Medium",
+        sw / 2, sh * 0.72 + 21, Color(255, 220, 80, alpha),
         TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
 end)
 
@@ -778,7 +1124,19 @@ net.Receive("RE4M_LobbyProgression", function()
     local json = util.Decompress(compressed)
     if not json then return end
 
-    local profiles = util.JSONToTable(json)
+    -- The server sends a list of { steamID = "...", ... }. Rebuild the map
+    -- keyed by the SteamID STRING the menus look up. ignoreConversions keeps
+    -- numeric-looking weapon class keys as strings too.
+    local decoded = util.JSONToTable(json, false, true)
+    local profiles
+    if istable(decoded) then
+        profiles = {}
+        for _, entry in ipairs(decoded) do
+            if istable(entry) and entry.steamID then
+                profiles[tostring(entry.steamID)] = entry
+            end
+        end
+    end
     if istable(profiles) then
         local current = RE4M_CLIENT.ProgressionProfiles or {}
         for steamID, newProfile in pairs(profiles) do

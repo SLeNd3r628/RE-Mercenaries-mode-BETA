@@ -70,24 +70,57 @@ function RE4M_LoadProgression()
     file.CreateDir(DATA_DIRECTORY)
     if not file.Exists(DATA_FILE, "DATA") then return end
 
+    -- The third argument (ignoreConversions) stops util.JSONToTable from
+    -- turning numeric-looking keys into numbers. Profiles used to be keyed by
+    -- SteamID64 ("7656119..."), which came back as a lossy number key, failed
+    -- the isstring() check below, and every profile was dropped on each map
+    -- load - so levels, weapon levels, skills and MP reset whenever the map
+    -- changed.
     local contents = file.Read(DATA_FILE, "DATA")
-    local decoded = contents and util.JSONToTable(contents)
-    if not istable(decoded) or not istable(decoded.players) then
+    local decoded = contents and util.JSONToTable(contents, false, true)
+    if not istable(decoded) then
         ErrorNoHalt("[RE4 Mercs] Progression JSON is invalid; starting with empty profiles.\n")
         return
     end
 
-    for steamID, profile in pairs(decoded.players) do
-        if isstring(steamID) and #steamID <= 32 then
-            RE4M_Progression.players[steamID] = NormalizeProfile(profile)
+    local loaded = 0
+    local function Store(steamID, profile)
+        if isnumber(steamID) then return end -- lossy legacy key; cannot be trusted
+        steamID = tostring(steamID or "")
+        if steamID == "" or #steamID > 32 then return end
+        RE4M_Progression.players[steamID] = NormalizeProfile(profile)
+        loaded = loaded + 1
+    end
+
+    -- Current format: a list where the SteamID is a string VALUE, which JSON
+    -- round-trips safely regardless of the conversion behaviour.
+    if istable(decoded.profiles) then
+        for _, entry in ipairs(decoded.profiles) do
+            if istable(entry) then Store(entry.steamID, entry.profile) end
         end
     end
+
+    -- Legacy format: { players = { [steamID] = profile } }.
+    if istable(decoded.players) then
+        for steamID, profile in pairs(decoded.players) do
+            if not RE4M_Progression.players[tostring(steamID)] then Store(steamID, profile) end
+        end
+    end
+
+    print("[RE4 Mercs] Loaded " .. loaded .. " progression profile(s).")
 end
 
 function RE4M_SaveProgression()
     if not RE4M_Progression then return end
     file.CreateDir(DATA_DIRECTORY)
-    local encoded = util.TableToJSON(RE4M_Progression, true)
+
+    local profiles = {}
+    for steamID, profile in pairs(RE4M_Progression.players) do
+        profiles[#profiles + 1] = { steamID = tostring(steamID), profile = profile }
+    end
+    table.sort(profiles, function(a, b) return a.steamID < b.steamID end)
+
+    local encoded = util.TableToJSON({ version = 2, profiles = profiles }, true)
     if not encoded then
         ErrorNoHalt("[RE4 Mercs] Failed to encode progression profiles.\n")
         return
@@ -104,7 +137,13 @@ function RE4M_GetPlayerProfile(ply)
     if not IsValid(ply) then return nil end
     local steamID = ply:SteamID64()
     if not steamID or steamID == "0" then steamID = ply:SteamID() end
-    if not steamID or steamID == "" then return nil end
+    -- Before Steam authentication finishes, SteamID() is "STEAM_ID_PENDING"
+    -- (or "UNKNOWN"). Every connecting player used to share, and save, that
+    -- one junk profile. PlayerAuthed re-applies the real profile later.
+    if not steamID or steamID == "" or steamID == "STEAM_ID_PENDING" or steamID == "UNKNOWN" then
+        return nil
+    end
+    if ply:IsBot() then steamID = "BOT_" .. ply:Nick() end
 
     local players = RE4M_Progression.players
     players[steamID] = players[steamID] or NewPlayerProfile()
@@ -116,7 +155,9 @@ local function ApplyPlayerProfile(ply, profile)
     ply:SetNWInt("RE4M_PlayerLevel", profile.level)
     ply:SetNWInt("RE4M_PlayerXP", profile.xp)
     ply:SetNWInt("RE4M_MercPoints", profile.mercPoints or 0)
-    ply:SetNWString("RE4M_OwnedSkills", util.TableToJSON(profile.ownedSkills or {}) or "[]")
+    -- NW2: plain NW strings are cut at 199 bytes. With about 12+ skills owned
+    -- the JSON was truncated, failed to parse, and the shop showed nothing owned.
+    ply:SetNW2String("RE4M_OwnedSkills", util.TableToJSON(profile.ownedSkills or {}) or "[]")
     for slot = 1, 3 do
         ply:SetNWString("RE4M_EquippedSkill" .. slot, profile.equippedSkills and profile.equippedSkills[slot] or "")
     end
@@ -145,7 +186,7 @@ end
 
 function RE4M_AwardPlayerXP(ply, amount)
     local profile = RE4M_GetPlayerProfile(ply)
-    if not profile then return 0 end
+    if not profile then return 0, 0 end
 
     amount = math.max(0, math.floor(tonumber(amount) or 0))
     if amount <= 0 then
@@ -325,7 +366,7 @@ hook.Add("PlayerSpawn", "RE4M_SyncSpawnedWeaponLevel", function(ply)
 end)
 
 function RE4M_PlayerHasSkill(ply, skillID)
-    if not IsValid(ply) then return false end
+    if not IsValid(ply) or not ply:IsPlayer() then return false end
     local profile = RE4M_GetPlayerProfile(ply)
     if not profile then return false end
     for _, equipped in ipairs(profile.equippedSkills or {}) do
@@ -493,6 +534,9 @@ hook.Add("EntityTakeDamage", "RE4M_WeaponProgressionDamage", function(target, dm
     if multiplier > 0 then dmgInfo:ScaleDamage(multiplier) end
     target.RE4M_LastDamageAttacker = attacker
     target.RE4M_LastDamageAt = CurTime()
+    -- Read by RE4M_OnKill to credit weapon XP to the weapon that actually
+    -- dealt the damage; it was read there but never written anywhere.
+    target.RE4M_LastWeaponClass = weaponClass
 end)
 
 function RE4M_SendLobbyProgression(requester, force)
@@ -518,7 +562,11 @@ function RE4M_SendLobbyProgression(requester, force)
             end
         end
 
-        summary[steamID] = {
+        -- A list with steamID as a string value: keying the table by SteamID64
+        -- made the client's JSON decode turn it into a lossy number key, so
+        -- lobby cards and the loadout Level column never found the profile.
+        summary[#summary + 1] = {
+            steamID = tostring(steamID),
             name = ply:Nick(),
             level = profile.level,
             xp = profile.xp,
@@ -548,7 +596,13 @@ net.Receive("RE4M_RequestProgression", function(_, ply)
     RE4M_SendLobbyProgression(ply)
 end)
 
-hook.Add("ShutDown", "RE4M_SaveProgressionOnShutdown", RE4M_SaveProgression)
+hook.Add("ShutDown", "RE4M_SaveProgressionOnShutdown", function() RE4M_SaveProgression() end)
+-- Also save when someone leaves, so a crash or forced quit after they
+-- disconnect cannot lose their progress.
+hook.Add("PlayerDisconnected", "RE4M_SaveProgressionOnDisconnect", function()
+    timer.Remove(SAVE_TIMER)
+    RE4M_SaveProgression()
+end)
 timer.Create("RE4M_NaturalHealing", 1, 0, function()
     for _, ply in ipairs(player.GetAll()) do
         if not IsValid(ply) or not ply:Alive() or ply:Health() >= ply:GetMaxHealth() then continue end

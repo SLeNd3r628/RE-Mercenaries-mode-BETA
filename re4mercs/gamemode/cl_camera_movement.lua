@@ -6,14 +6,18 @@ local cvMovement = CreateClientConVar("re4m_movement_enabled", "0", true, false,
     "Enable camera-relative movement and movement-facing")
 local cvDebug = CreateClientConVar("re4m_camera_debug", "0", true, false,
     "Show camera and movement debug information")
-local cvDistance = CreateClientConVar("re4m_camera_distance", "112", true, false,
-    "Over-the-shoulder camera distance", 45, 180)
-
 local CAMERA = {
-    walk = { distance = 112, side = 25, height = 8, fov = 78, lookDown = 7 },
-    aim = { distance = 64, side = 29, height = 5, fov = 62, lookDown = 4 },
-    sprint = { distance = 124, side = 24, height = -16, fov = 81, lookDown = 8 },
-    crouch = { distance = 94, side = 24, height = 35, fov = 75, lookDown = 12 },
+    -- Tight over-the-shoulder framing keeps the waist at the lower edge of
+    -- view during normal movement; sprint pulls back to retain situational view.
+    walk = { distance = 45, side = 25, height = 3, fov = 72, lookDown = 4 },
+    -- Shoulder framing similar to the reference image. Aim view is a fixed
+    -- preset; there is no mouse-wheel or distance-convar zoom.
+    aim = { distance = 35, side = 15, height = 3, fov = 72, lookDown = 4 },
+    sprint = { distance = 52, side = 12, height = -16, fov = 81, lookDown = 8 },
+    -- Dedicated action framing copied from sprint, so door kicks and counters
+    -- use the wider, pulled-back sprint view even while standing still.
+    action = { distance = 52, side = 12, height = -16, fov = 81, lookDown = 8 },
+    crouch = { distance = 55, side = 12, height = 15, fov = 75, lookDown = 12 },
 }
 
 local shoulderSign = 1
@@ -26,6 +30,24 @@ local lastTrace = nil
 local lastPivot = nil
 local lastWishOrigin = nil
 local cameraState = "walk"
+local counterCameraState
+local lastCounterCameraVariant
+local rollCameraState
+local lastRollCameraVariant
+
+local COUNTER_CAMERA_VARIANTS = {
+	{side = 56, back = 42, height = 30, fov = 76, sign = 1},
+	{side = 64, back = 50, height = 42, fov = 73, sign = -1},
+	{side = 46, back = 62, height = 24, fov = 79, sign = 1},
+	{side = 72, back = 48, height = 34, fov = 74, sign = -1},
+}
+
+local ROLL_CAMERA_VARIANTS = {
+	{side = 34, back = 66, height = 24, fov = 77, sign = 1},
+	{side = 46, back = 74, height = 32, fov = 74, sign = -1},
+	{side = 28, back = 82, height = 20, fov = 80, sign = 1},
+	{side = 52, back = 70, height = 38, fov = 75, sign = -1},
+}
 
 local function ResetRig()
     cameraAngles = nil
@@ -35,6 +57,23 @@ local function ResetRig()
     lastPivot = nil
     lastWishOrigin = nil
     wasMovementEnabled = false
+    counterCameraState = nil
+    rollCameraState = nil
+end
+
+local function SaveCameraAimRay(view)
+	RE4M_CAMERA_AIM_ORIGIN = view.origin
+	RE4M_CAMERA_AIM_DIRECTION = view.angles:Forward()
+	return view
+end
+
+function RE4M_GetCameraAimRay()
+	local ply = LocalPlayer()
+	if not IsValid(ply) then return end
+	if isvector(RE4M_CAMERA_AIM_ORIGIN) and isvector(RE4M_CAMERA_AIM_DIRECTION) then
+		return RE4M_CAMERA_AIM_ORIGIN, RE4M_CAMERA_AIM_DIRECTION
+	end
+	return ply:EyePos(), ply:GetAimVector()
 end
 
 local function IsUsablePlayer(ply)
@@ -58,6 +97,128 @@ local function GetCameraPivot(ply)
 
     -- Keep the pivot around the upper chest for different player hull heights.
     return ply:GetPos() + Vector(0, 0, math.Clamp(height * 0.78, 28, 58))
+end
+
+local function GetCounterBonePosition(ent, boneNames, fallback)
+	if not IsValid(ent) then return fallback end
+	for _, boneName in ipairs(boneNames) do
+		local bone = ent:LookupBone(boneName)
+		if bone then
+			local position = ent:GetBonePosition(bone)
+			if isvector(position) and position:LengthSqr() > 0 then return position end
+		end
+	end
+	return fallback
+end
+
+local function BuildCounterCamera(ply, origin, angles, fov, counterEnd)
+	local focus = GetCounterBonePosition(ply, {
+		"ValveBiped.Bip01_Spine2",
+		"ValveBiped.Bip01_Spine1",
+		"ValveBiped.Bip01_Head1",
+	}, ply:WorldSpaceCenter())
+	local approach = ply:GetForward()
+	approach.z = 0
+	if approach:LengthSqr() < 0.001 then approach = ply:GetForward() end
+	approach:Normalize()
+	local right = Angle(0, approach:Angle().y, 0):Right()
+
+	if not counterCameraState or counterCameraState.endsAt ~= counterEnd then
+		local variantIndex = math.random(#COUNTER_CAMERA_VARIANTS)
+		if #COUNTER_CAMERA_VARIANTS > 1 and variantIndex == lastCounterCameraVariant then
+			variantIndex = variantIndex % #COUNTER_CAMERA_VARIANTS + 1
+		end
+		lastCounterCameraVariant = variantIndex
+		counterCameraState = {
+			endsAt = counterEnd,
+			variant = COUNTER_CAMERA_VARIANTS[variantIndex],
+			position = origin,
+			angles = angles,
+			fov = fov,
+		}
+	end
+
+	local variant = counterCameraState.variant
+	local desiredOrigin = focus - approach * variant.back + right * variant.side * variant.sign + Vector(0, 0, variant.height)
+	local trace = util.TraceHull({
+		start = focus,
+		endpos = desiredOrigin,
+		mins = Vector(-4, -4, -4),
+		maxs = Vector(4, 4, 4),
+		mask = MASK_SOLID,
+		filter = ply,
+	})
+	if trace.Hit then desiredOrigin = trace.HitPos + trace.HitNormal * 3 end
+
+	local desiredAngles = (focus - desiredOrigin):Angle()
+	desiredAngles.r = 0
+	local blend = math.min(FrameTime() * 9, 1)
+	counterCameraState.position = LerpVector(blend, counterCameraState.position, desiredOrigin)
+	counterCameraState.angles = LerpAngle(blend, counterCameraState.angles, desiredAngles)
+	counterCameraState.fov = Lerp(blend, counterCameraState.fov, variant.fov)
+	cameraState = "counter"
+
+	return {
+		origin = counterCameraState.position,
+		angles = counterCameraState.angles,
+		fov = counterCameraState.fov,
+		drawviewer = true,
+	}
+end
+
+local function BuildRollCamera(ply, origin, angles, fov, rollEnd)
+	local focus = GetCounterBonePosition(ply, {
+		"ValveBiped.Bip01_Spine2",
+		"ValveBiped.Bip01_Spine1",
+		"ValveBiped.Bip01_Pelvis",
+	}, ply:WorldSpaceCenter())
+	local forward = ply:GetForward()
+	forward.z = 0
+	if forward:LengthSqr() < 0.001 then forward = Angle(0, angles.y, 0):Forward() end
+	forward:Normalize()
+	local right = Angle(0, forward:Angle().y, 0):Right()
+
+	if not rollCameraState or rollCameraState.endsAt ~= rollEnd then
+		local variantIndex = math.random(#ROLL_CAMERA_VARIANTS)
+		if #ROLL_CAMERA_VARIANTS > 1 and variantIndex == lastRollCameraVariant then
+			variantIndex = variantIndex % #ROLL_CAMERA_VARIANTS + 1
+		end
+		lastRollCameraVariant = variantIndex
+		rollCameraState = {
+			endsAt = rollEnd,
+			variant = ROLL_CAMERA_VARIANTS[variantIndex],
+			position = origin,
+			angles = angles,
+			fov = fov,
+		}
+	end
+
+	local variant = rollCameraState.variant
+	local desiredOrigin = focus - forward * variant.back + right * variant.side * variant.sign + Vector(0, 0, variant.height)
+	local trace = util.TraceHull({
+		start = focus,
+		endpos = desiredOrigin,
+		mins = Vector(-4, -4, -4),
+		maxs = Vector(4, 4, 4),
+		mask = MASK_SOLID,
+		filter = ply,
+	})
+	if trace.Hit then desiredOrigin = trace.HitPos + trace.HitNormal * 3 end
+
+	local desiredAngles = (focus - desiredOrigin):Angle()
+	desiredAngles.r = 0
+	local blend = math.min(FrameTime() * 14, 1)
+	rollCameraState.position = LerpVector(blend, rollCameraState.position, desiredOrigin)
+	rollCameraState.angles = LerpAngle(blend, rollCameraState.angles, desiredAngles)
+	rollCameraState.fov = Lerp(blend, rollCameraState.fov, variant.fov)
+	cameraState = "roll"
+
+	return {
+		origin = rollCameraState.position,
+		angles = rollCameraState.angles,
+		fov = rollCameraState.fov,
+		drawviewer = true,
+	}
 end
 
 local function IsAiming(ply, cmd)
@@ -110,7 +271,10 @@ local function CreateMove(cmd)
     local aiming = IsAiming(ply, cmd)
 
     if cvCamera:GetBool() then
-        if moving or aiming or firing then
+        if aiming then
+            -- Keep the character locked to the aim direction with no yaw catch-up.
+            bodyYaw = cameraAngles.y
+        elseif moving or firing then
             -- Keep the camera and character facing aligned while active. The
             -- idle free-look can orbit, but movement/aim never spins around a
             -- body that is facing a different direction.
@@ -149,7 +313,26 @@ local function CreateMove(cmd)
 end
 
 local function CalcView(ply, origin, angles, fov)
-    if not cvCamera:GetBool() or not IsUsablePlayer(ply) then return end
+	local counterEnd = IsValid(ply) and ply:GetNW2Float("RE4M_CounterTime", 0) or 0
+	if counterEnd > CurTime() and IsUsablePlayer(ply) then
+		return SaveCameraAimRay(BuildCounterCamera(ply, origin, angles, fov, counterEnd))
+	end
+	counterCameraState = nil
+	local rollEnd = IsValid(ply) and ply:GetNW2Float("RE4M_RollEndTime", 0) or 0
+	if rollEnd > CurTime() and IsUsablePlayer(ply) then
+		return SaveCameraAimRay(BuildRollCamera(ply, origin, angles, fov, rollEnd))
+	end
+	rollCameraState = nil
+	local parryAction = IsValid(ply) and ply:GetNW2Float("RE4M_ParryTime", 0) > CurTime()
+	local rollAction = IsValid(ply) and ply:GetNW2Float("RE4M_RollEndTime", 0) > CurTime()
+	local actionCamera = IsValid(ply) and (ply:GetNW2Float("RE4M_DoorKickTime", 0) > CurTime() or parryAction or rollAction)
+    if (not cvCamera:GetBool() and not actionCamera) or not IsUsablePlayer(ply) then
+		if IsValid(ply) and ply == LocalPlayer() then
+			RE4M_CAMERA_AIM_ORIGIN = nil
+			RE4M_CAMERA_AIM_DIRECTION = nil
+		end
+		return
+	end
 
     local viewAngles = cameraAngles or ply:EyeAngles()
     local aiming = ply:KeyDown(IN_ATTACK2)
@@ -157,7 +340,9 @@ local function CalcView(ply, origin, angles, fov)
     local crouching = ply:Crouching()
 
     local preset
-    if aiming then
+    if actionCamera then
+        preset, cameraState = CAMERA.action, "action"
+    elseif aiming then
         preset, cameraState = CAMERA.aim, "aim"
     elseif crouching then
         preset, cameraState = CAMERA.crouch, "crouch"
@@ -171,9 +356,6 @@ local function CalcView(ply, origin, angles, fov)
     local forward = Angle(0, viewAngles.y, 0):Forward()
     local right = Angle(0, viewAngles.y, 0):Right()
     local distance = preset.distance
-    if cvDistance:GetFloat() ~= 112 then
-        distance = distance * (cvDistance:GetFloat() / 112)
-    end
 
     local shoulder = preset.side * shoulderSign
     local wishOrigin = pivot - forward * distance + right * shoulder + Vector(0, 0, preset.height)
@@ -200,30 +382,40 @@ local function CalcView(ply, origin, angles, fov)
 
     local safeOrigin = tr.Hit and (tr.HitPos + tr.HitNormal * 3) or wishOrigin
     if not smoothedOrigin then smoothedOrigin = safeOrigin end
-    local followRate = aiming and 18 or (sprinting and 7 or 11)
-    smoothedOrigin = LerpVector(math.min(FrameTime() * followRate, 1), smoothedOrigin, safeOrigin)
+    if aiming and not actionCamera then
+        -- Collision still constrains the camera, but aiming does not trail the
+        -- shoulder position or reticle behind the player's current aim.
+        smoothedOrigin = safeOrigin
+    else
+        local followRate = (sprinting or actionCamera) and 7 or 11
+        smoothedOrigin = LerpVector(math.min(FrameTime() * followRate, 1), smoothedOrigin, safeOrigin)
+    end
 
     local targetFOV = preset.fov
-    smoothedFOV = math.Approach(smoothedFOV, targetFOV, (aiming and 220 or 130) * FrameTime())
+    if aiming and not actionCamera then
+        smoothedFOV = targetFOV
+    else
+        smoothedFOV = math.Approach(smoothedFOV, targetFOV, 130 * FrameTime())
+    end
 
     local cameraViewAngles = Angle(viewAngles.p + preset.lookDown, viewAngles.y, 0)
     cameraViewAngles.p = math.Clamp(cameraViewAngles.p, -80, 80)
 
-    return {
+    return SaveCameraAimRay({
         origin = smoothedOrigin,
         angles = cameraViewAngles,
         fov = smoothedFOV,
         drawviewer = true,
-    }
+    })
 end
 
 hook.Add("CreateMove", "RE4M_CameraMovement_CreateMove", CreateMove)
 hook.Add("CalcView", "RE4M_CameraMovement_CalcView", CalcView)
 hook.Add("ShouldDrawLocalPlayer", "RE4M_CameraMovement_DrawPlayer", function(ply)
-    if cvCamera:GetBool() and IsUsablePlayer(ply) then return true end
+    if IsUsablePlayer(ply) and (cvCamera:GetBool() or ply:GetNW2Float("RE4M_RollEndTime", 0) > CurTime()) then return true end
 end)
 hook.Add("PreDrawViewModel", "RE4M_CameraMovement_HideViewModel", function(_, ply)
-    if cvCamera:GetBool() and IsUsablePlayer(ply) then return true end
+    if IsUsablePlayer(ply) and (cvCamera:GetBool() or ply:GetNW2Float("RE4M_RollEndTime", 0) > CurTime()) then return true end
 end)
 hook.Add("AdjustMouseSensitivity", "RE4M_CameraMovement_Sensitivity", function()
     if cvCamera:GetBool() and IsUsablePlayer(LocalPlayer()) then return 1 end
@@ -246,13 +438,6 @@ end, nil, "Toggle RE4 Mercenaries camera-relative movement (0 or 1)")
 concommand.Add("re4m_camera_shoulder", function()
     shoulderSign = -shoulderSign
 end, nil, "Swap the over-the-shoulder camera side")
-
-hook.Add("CreateMove", "RE4M_CameraMovement_ZoomWheel", function(cmd)
-    if not cvCamera:GetBool() then return end
-    local wheel = cmd:GetMouseWheel()
-    if wheel == 0 then return end
-    RunConsoleCommand("re4m_camera_distance", tostring(math.Clamp(cvDistance:GetFloat() - wheel * 8, 45, 180)))
-end)
 
 hook.Add("PostDrawTranslucentRenderables", "RE4M_CameraMovement_DebugWorld", function()
     if not cvDebug:GetBool() or not cvCamera:GetBool() or not lastPivot then return end

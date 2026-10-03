@@ -16,10 +16,16 @@ net.Receive("RE4M_AdminPanel", function(len, ply)
         RE4M_EndRound()
 
     elseif command == "restart" then
-        RE4M_EndRound()
-        timer.Simple(2, function()
+        -- Skip the results screen and start a fresh match. The old version
+        -- also fired from the menu and could start two overlapping rounds
+        -- when clicked twice.
+        if RE4M_STATE.GameState == GAMESTATE_ACTIVE or RE4M_STATE.GameState == GAMESTATE_PREROUND or
+           RE4M_STATE.GameState == GAMESTATE_POSTROUND then
+            RE4M_StopSpawning()
+            RE4M_CleanupNPCs()
+            RE4M_CleanupPickups()
             RE4M_StartPreRound()
-        end)
+        end
 
     elseif command == "cleanup" then
         RE4M_CleanupNPCs()
@@ -27,6 +33,8 @@ net.Receive("RE4M_AdminPanel", function(len, ply)
 
     elseif command == "add_time" then
         local seconds = net.ReadFloat()
+        if seconds ~= seconds then return end -- NaN
+        seconds = math.Clamp(seconds, 1, 600)
         if RE4M_STATE.GameState == GAMESTATE_ACTIVE then
             RE4M_ExtendTime(seconds)
         end
@@ -35,7 +43,8 @@ net.Receive("RE4M_AdminPanel", function(len, ply)
         local max = net.ReadUInt(16)
         local cvar = GetConVar("re4m_basemaxnpcs")
         if cvar then
-            cvar:SetInt(math.Clamp(max, 1, RE4MERCS_CONFIG.AbsoluteMaxNPCs or 40))
+            local cfg = RE4MERCS_GetConfig()
+            cvar:SetInt(math.Clamp(max, 1, cfg.AbsoluteMaxNPCs or 40))
         else
             RE4MERCS_CONFIG.BaseMaxNPCs = max
         end
@@ -66,6 +75,12 @@ hook.Add("PlayerSay", "RE4M_ChatCommands", function(ply, text, teamChat)
             return ""
         end
 
+    elseif text == "!admin" or text == "/admin" then
+        if ply:RE4M_IsAdmin() then
+            ply:ConCommand("re4m_adminpanel")
+            return ""
+        end
+
     elseif text == "!menu" or text == "/menu" then
         if RE4M_STATE.GameState == GAMESTATE_MENU or RE4M_STATE.GameState == GAMESTATE_WAITING then
             net.Start("RE4M_ForceMenu")
@@ -74,6 +89,12 @@ hook.Add("PlayerSay", "RE4M_ChatCommands", function(ply, text, teamChat)
         end
 
     elseif text == "!ready" or text == "/ready" then
+        -- Ready only means something in the lobby (the net handler already
+        -- enforced this; the chat command did not).
+        if RE4M_STATE.GameState ~= GAMESTATE_MENU and RE4M_STATE.GameState ~= GAMESTATE_WAITING then
+            ply:ChatPrint("[RE4 Mercs] You can only ready up in the lobby.")
+            return ""
+        end
         ply.RE4M_Ready = not ply.RE4M_Ready
         ply:SetNWBool("RE4M_Ready", ply.RE4M_Ready)
         RE4M_UpdateLobbyReadyState()
@@ -83,11 +104,12 @@ hook.Add("PlayerSay", "RE4M_ChatCommands", function(ply, text, teamChat)
     elseif string.StartWith(text, "!theme ") or string.StartWith(text, "/theme ") then
         if ply:RE4M_IsAdmin() then
             local theme = string.sub(text, 8)
-            RE4M_STATE.CurrentTheme = string.Trim(theme)
-            net.Start("RE4M_ThemeInfo")
-                net.WriteString(RE4M_STATE.CurrentTheme)
-            net.Broadcast()
-            ply:ChatPrint("[RE4 Mercs] Theme set to: " .. RE4M_STATE.CurrentTheme)
+            if RE4M_SetTheme(theme) then
+                ply:ChatPrint("[RE4 Mercs] Theme set to: " .. RE4M_STATE.CurrentTheme)
+            else
+                local cfg = RE4MERCS_GetConfig()
+                ply:ChatPrint("[RE4 Mercs] Unknown theme. Valid: " .. table.concat(cfg.EnabledThemes or {}, ", "))
+            end
             return ""
         end
     end

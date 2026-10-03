@@ -201,6 +201,8 @@ function RE4M_DrawEchoTeamMessage()
         alpha = 255 * math.max(0, 1 - prog)
     end
 
+    -- The fade-in math above overshoots 255 once the 0.6s fade completes.
+    alpha = math.Clamp(alpha, 0, 255)
     if text == "" or alpha <= 10 then return end
 
     local sw, sh = ScrW(), ScrH()
@@ -314,6 +316,15 @@ function RE4M_DrawActiveHUD()
         -- Combo timeout bar
         local cfg     = RE4MERCS_GetConfig and RE4MERCS_GetConfig()
         local timeout = (cfg and cfg.ComboTimeout) or 8
+        -- Mirror the server's Go For Broke! bonus so the bar matches reality.
+        if timeLeft <= 30 then
+            for slot = 1, 3 do
+                if ply:GetNWString("RE4M_EquippedSkill" .. slot, "") == "go_for_broke" then
+                    timeout = timeout + 2
+                    break
+                end
+            end
+        end
         local comboFraction = 1.0
 
         if RE4M_CLIENT._lastComboTime then
@@ -395,6 +406,17 @@ function RE4M_DrawActiveHUD()
                 hudColors.secondary or Color(255, 200, 50),
                 TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
         end
+    end
+
+    -- ============ RESPAWN PROMPT ============
+    local respawnCfg = RE4MERCS_GetConfig and RE4MERCS_GetConfig()
+    if not ply:Alive() and respawnCfg and respawnCfg.RespawnEnabled then
+        local wait = math.ceil(ply:GetNW2Float("RE4M_RespawnAt", 0) - CurTime())
+        local text = wait > 0 and ("RESPAWN IN " .. wait)
+            or ("PRESS [ " .. string.upper(input.LookupBinding("+attack") or "MOUSE1") .. " ] TO RESPAWN")
+        draw.SimpleText(text, "RE4M_Popup", sw / 2, sh * 0.6,
+            Color(255, 220, 80, 200 + math.sin(CurTime() * 6) * 55),
+            TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
     end
 
     -- ============ KILLS (Top Left) ============
@@ -620,7 +642,7 @@ function RE4M_DrawTimeExtendNotifs()
         local y     = 80 + (i - 1) * 25 - age * 20
         local alpha = notif.alpha
 
-        draw.SimpleText("+" .. tostring(notif.seconds) .. "s", "RE4M_Medium",
+        draw.SimpleText("+" .. string.format("%g", math.Round(notif.seconds or 0, 1)) .. "s", "RE4M_Medium",
             sw / 2, y,
             Color(50, 255, 50, alpha),
             TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
@@ -740,8 +762,10 @@ hook.Add("HUDPaint", "RE4M_EnemyHealthBars", function()
         end
 
         local enemyLevel = ent:GetNWInt("RE4M_EnemyLevel", isElite and 2 or 1)
-        local enemyHealth = math.max(ent:Health(), 0)
         local enemyMaxHealth = math.max(ent:GetNWInt("RE4M_EnemyMaxHealth", ent:GetMaxHealth()), 1)
+        -- ent:Health() is not networked for most NPCs and read 0 here.
+        local enemyHealth = ent:GetNWInt("RE4M_EnemyHealth", -1)
+        if enemyHealth < 0 then enemyHealth = math.floor(enemyMaxHealth * healthFrac) end
         draw.SimpleText("Lv. " .. enemyLevel .. "  •  HP " .. enemyHealth .. " / " .. enemyMaxHealth, "RE4M_EnemyLevel",
             barLeft, barTop + barHeight + 1,
             Color(255, 198, 95, distAlpha), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
@@ -957,4 +981,179 @@ hook.Add("HUDPaint", "RE4M_NavmeshWarning", function()
         sw / 2, sh - 8,
         Color(200, 200, 200, 200),
         TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+end)
+
+-- ============================================
+-- SCREEN VIGNETTES (herb used / perfect dodge)
+-- ============================================
+
+local VIGNETTES = {
+    -- Green edge glow when a herb heals you.
+    herb  = { material = Material("vgui/re4mercs/herb_used_vignette.png", "smooth"),  fadeIn = 0.08, hold = 0.35, fadeOut = 0.9, alpha = 255 },
+    -- White flash when a roll's invulnerability makes an attack miss.
+    dodge = { material = Material("vgui/re4mercs/perfect_dodge_vingette.png", "smooth"), fadeIn = 0.04, hold = 0.15, fadeOut = 0.6, alpha = 255 },
+}
+local activeVignettes = {}
+
+--- Show a full-screen vignette ("herb" or "dodge"); re-triggering restarts it.
+function RE4M_FlashVignette(kind)
+    local data = VIGNETTES[kind]
+    if not data or data.material:IsError() then return end
+    activeVignettes[kind] = CurTime()
+end
+
+net.Receive("RE4M_PerfectDodge", function()
+    RE4M_FlashVignette("dodge")
+end)
+
+-- HUDPaintBackground draws beneath the regular HUD, so the vignettes tint the
+-- screen edges without covering the timer, score or health panels.
+hook.Add("HUDPaintBackground", "RE4M_ScreenVignettes", function()
+    if next(activeVignettes) == nil then return end
+    local ply = LocalPlayer()
+    if not IsValid(ply) or not ply:Alive() then
+        activeVignettes = {}
+        return
+    end
+
+    local sw, sh = ScrW(), ScrH()
+    local now = CurTime()
+    for kind, startTime in pairs(activeVignettes) do
+        local data = VIGNETTES[kind]
+        local t = now - startTime
+        local total = data.fadeIn + data.hold + data.fadeOut
+        if t >= total then
+            activeVignettes[kind] = nil
+        else
+            local frac
+            if t < data.fadeIn then
+                frac = t / data.fadeIn
+            elseif t < data.fadeIn + data.hold then
+                frac = 1
+            else
+                frac = 1 - (t - data.fadeIn - data.hold) / data.fadeOut
+            end
+            surface.SetDrawColor(255, 255, 255, data.alpha * math.Clamp(frac, 0, 1))
+            surface.SetMaterial(data.material)
+            surface.DrawTexturedRect(0, 0, sw, sh)
+        end
+    end
+end)
+
+-- ============================================
+-- GET-HIT SCREEN EFFECT
+-- ============================================
+-- Recreates the otherworldHUD_v2 damage feedback with this mode's gethit
+-- images: a random blood overlay held ~1.5s then stretched and faded over
+-- 0.6s, a light screen blur, the half of the screen facing the attacker
+-- darkened, a small shake/view punch and a brief movement slow. The server
+-- sends RE4M_PlayerHit with the attacker's position (sv_scoring.lua), so
+-- the side darkening knows where the hit came from.
+
+-- Material() returns two values (material, load time); wrapping each call in
+-- parentheses keeps only the material. Unwrapped, the last entry expanded
+-- into a stray number and every hit threw "attempt to index local 'mat'".
+local GETHIT_MATS = {
+    (Material("vgui/re4mercs/gethit_1.png", "smooth mips")),
+    (Material("vgui/re4mercs/gethit_2.png", "smooth mips")),
+    (Material("vgui/re4mercs/gethit_3.png", "smooth mips")),
+}
+local GETHIT_HOLD, GETHIT_FADE = 1.5, 0.6   -- overlay: full strength, then stretch-fade
+local GETHIT_SIDE_TIME = 0.8                -- attacker-side darkening
+local GETHIT_SLOW_TIME = 0.35               -- movement slow after a hit
+local gethitMat, gethitStart, gethitUntil = nil, 0, 0
+local gethitSide, gethitSideUntil = 0, 0
+local gethitSlowUntil, gethitLastTrigger = 0, 0
+local gethitBlur = Material("pp/blurscreen")
+
+local function RE4M_StartHitFeedback(sourcePosition)
+    local ply = LocalPlayer()
+    if not IsValid(ply) or not ply:Alive() then return end
+    local now = CurTime()
+
+    -- Shotgun pellets / multi-hits arrive together: restart the overlay at
+    -- most every 0.08s, but always update which side the hit came from.
+    if now - gethitLastTrigger >= 0.08 then
+        gethitLastTrigger = now
+        local choices = {}
+        for _, mat in ipairs(GETHIT_MATS) do
+            if not mat:IsError() then choices[#choices + 1] = mat end
+        end
+        gethitMat = #choices > 0 and choices[math.random(#choices)] or nil
+        gethitStart, gethitUntil = now, now + GETHIT_HOLD + GETHIT_FADE
+        gethitSlowUntil = now + GETHIT_SLOW_TIME
+        util.ScreenShake(ply:GetPos(), 2, 5, 0.25, 350)
+        ply:ViewPunch(Angle(-0.35, math.Rand(-0.3, 0.3), 0))
+    end
+
+    if isvector(sourcePosition) then
+        local incoming = sourcePosition - ply:EyePos()
+        incoming.z = 0
+        if incoming:LengthSqr() > 0.001 then
+            incoming:Normalize()
+            local right = ply:EyeAngles():Right()
+            right.z = 0
+            right:Normalize()
+            local side = incoming:Dot(right)
+            if math.abs(side) > 0.05 then
+                -- Darken the half of the screen opposite the attacker.
+                gethitSide = side > 0 and -1 or 1
+                gethitSideUntil = now + GETHIT_SIDE_TIME
+            end
+        end
+    end
+end
+
+net.Receive("RE4M_PlayerHit", function()
+    local hasSource = net.ReadBool()
+    RE4M_StartHitFeedback(hasSource and net.ReadVector() or nil)
+end)
+
+-- Brief movement slow, easing back from 62% to full speed.
+hook.Add("CreateMove", "RE4M_HitSlow", function(cmd)
+    local remaining = gethitSlowUntil - CurTime()
+    if remaining <= 0 then return end
+    local scale = Lerp(math.Clamp(remaining / GETHIT_SLOW_TIME, 0, 1), 1, 0.62)
+    cmd:SetForwardMove(cmd:GetForwardMove() * scale)
+    cmd:SetSideMove(cmd:GetSideMove() * scale)
+end)
+
+hook.Add("RenderScreenspaceEffects", "RE4M_HitBlur", function()
+    local now = CurTime()
+    if gethitUntil <= now then return end
+    local elapsed = now - gethitStart
+    local strength = elapsed < GETHIT_HOLD and 0.12
+        or 0.12 * (1 - math.Clamp((elapsed - GETHIT_HOLD) / GETHIT_FADE, 0, 1))
+    if strength <= 0 then return end
+    gethitBlur:SetFloat("$blur", strength * 4)
+    gethitBlur:Recompute()
+    render.UpdateScreenEffectTexture()
+    render.SetMaterial(gethitBlur)
+    render.DrawScreenQuad()
+end)
+
+hook.Add("HUDPaintBackground", "RE4M_HitOverlay", function()
+    local ply = LocalPlayer()
+    local now = CurTime()
+    if not IsValid(ply) or not ply:Alive() then
+        gethitUntil, gethitSideUntil, gethitSlowUntil = 0, 0, 0
+        return
+    end
+    local w, h = ScrW(), ScrH()
+
+    if gethitMat and gethitUntil > now then
+        local elapsed = now - gethitStart
+        local stretch = math.Clamp((elapsed - GETHIT_HOLD) / GETHIT_FADE, 0, 1)
+        local alpha = elapsed <= GETHIT_HOLD and 150 or 150 * (1 - stretch)
+        -- Blood "runs": the overlay stretches downward and slightly wider as it fades.
+        surface.SetDrawColor(255, 255, 255, alpha)
+        surface.SetMaterial(gethitMat)
+        surface.DrawTexturedRect(-w * stretch * 0.015, 0, w * (1 + stretch * 0.03), h * (1 + stretch * 0.45))
+    end
+
+    if gethitSide ~= 0 and gethitSideUntil > now then
+        local fade = math.Clamp((gethitSideUntil - now) / GETHIT_SIDE_TIME, 0, 1)
+        surface.SetDrawColor(0, 0, 0, 115 * fade)
+        surface.DrawRect(gethitSide < 0 and 0 or w / 2, 0, w / 2, h)
+    end
 end)

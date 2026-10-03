@@ -7,13 +7,14 @@ GM.Email   = ""
 GM.Website = ""
 GM.Base    = "base"
 
--- mount wOS Blade Symphony animations for the parry
+-- mount wOS animations
 wOS = wOS or {}
 wOS.AnimExtension = wOS.AnimExtension or {}
 wOS.AnimExtension.Mounted = wOS.AnimExtension.Mounted or {}
 
 wOS.AnimExtension.Mounted["Blade Symphony"] = true
 wOS.AnimExtension.Mounted[ "Resident Evil The Mercenaries" ] = true
+wOS.AnimExtension.Mounted[ "Action Half-life" ] = true
 
 
 -- ============================================
@@ -39,6 +40,11 @@ RE4MERCS_NET = {
     "RE4M_SetPlayerColor",
     "RE4M_ParryRequest",
     "RE4M_PlayParryAnim",
+    "RE4M_CounterRequest",
+    "RE4M_PlayCounterAnim",
+    "RE4M_DoorKickRequest",
+    "RE4M_PlayDoorKick",
+    "RE4M_UsePickupRequest",
     "RE4M_SetTheme",
     "RE4M_SetCustomNPCs",
     "RE4M_WeaponList",
@@ -67,7 +73,11 @@ RE4MERCS_NET = {
     "RE4M_BuySkill",
     "RE4M_ToggleSkill",
     "RE4M_SetEquippedSkills",
-    "RE4M_SkillShopResult"
+    "RE4M_SkillShopResult",
+    "RE4M_RequestCustomNPCs",
+    "RE4M_CustomNPCList",
+    "RE4M_PerfectDodge",
+    "RE4M_PlayerHit",
 }
 
 -- Mercenary perks inspired by RE6's skills list, adapted to systems this mode
@@ -164,6 +174,27 @@ RE4MERCS_CONFIG.PlayerRunSpeed       = 300
 RE4MERCS_CONFIG.PlayerWalkSpeed      = 200
 RE4MERCS_CONFIG.RespawnEnabled       = false
 RE4MERCS_CONFIG.FriendlyFire         = false
+RE4MERCS_CONFIG.RollEnabled          = true
+RE4MERCS_CONFIG.RollCooldown         = 0.8
+RE4MERCS_CONFIG.RollIFrame           = 0.2
+RE4MERCS_CONFIG.RollForwardDistance  = 220
+RE4MERCS_CONFIG.RollSideDistance     = 165
+RE4MERCS_CONFIG.RollBackDistance     = 145
+
+-- Parry / counter / door kick. These need typed defaults here: without them
+-- RE4MERCS_GetConfig() turned the ConVar value "0" into the number 0, which is
+-- truthy in Lua, so "re4m_parry_enabled 0" never actually disabled parrying.
+RE4MERCS_CONFIG.ParryEnabled         = true
+RE4MERCS_CONFIG.ParryRange           = 120
+RE4MERCS_CONFIG.ParryCooldown        = 0.9
+RE4MERCS_CONFIG.ParryDuration        = 0.95
+RE4MERCS_CONFIG.CounterEnabled       = true
+RE4MERCS_CONFIG.CounterRange         = 120
+RE4MERCS_CONFIG.CounterDamage        = 750
+RE4MERCS_CONFIG.CounterDuration      = 1.2
+RE4MERCS_CONFIG.DoorKickRange        = 100
+RE4MERCS_CONFIG.RespawnDelay         = 5
+RE4MERCS_CONFIG.BlockHUDAddons       = true
 
 -- Music volumes / paths (paths stay as defaults; volumes are ConVars)
 RE4MERCS_CONFIG.MenuMusic            = "ui/menu.ogg"
@@ -277,8 +308,8 @@ RE4MERCS_CONFIG.ThemeNPCs = {
     default = {
         regular = { "npc_zombie", "npc_fastzombie", "npc_poisonzombie" },
         elite   = { "npc_fastzombie", "npc_poisonzombie" },
-        re4_regular = { "drg_roach_re4_ganado" },
-        re4_elite   = { "drg_roach_re4_ganado_drs", "drg_roach_re4_garrador", "drg_roach_re4_brute" },
+        re4_regular = { "drg_roach_re4_ganado", "drg_roach_re4_novistador", "drg_roach_re4_dog" },
+        re4_elite   = { "drg_roach_re4_ganado_drs", "drg_roach_re4_garrador", "drg_roach_re4_brute", "drg_roach_re4_regenerador" },
     },
     halflife = {
         regular = { "npc_zombie", "npc_fastzombie", "npc_antlion", "npc_antlion_worker" },
@@ -379,6 +410,10 @@ local RE4M_CVAR_MAP = {
     {"re4m_playerwalkspeed",      "PlayerWalkSpeed",      "200", "Walk speed"},
     {"re4m_respawnenabled",       "RespawnEnabled",       "0",   "Allow respawns during round"},
     {"re4m_friendlyfire",         "FriendlyFire",         "0",   "Enable friendly fire"},
+    {"re4m_respawndelay",         "RespawnDelay",         "5",   "Seconds before a dead player may respawn (when respawns are enabled)"},
+
+    -- Other addons
+    {"re4m_blockhudaddons",       "BlockHUDAddons",       "1",   "Disable other addons' HUDs while playing this gamemode"},
 
     -- Music volumes
     {"re4m_menumusicvolume",      "MenuMusicVolume",      "0.4", "Menu music volume"},
@@ -394,17 +429,51 @@ local RE4M_CVAR_MAP = {
     {"re4m_allplayersadmin",      "AllPlayersAdmin",      "0",   "Everyone is admin (testing)"},
 
     -- Parry
-    {"re4m_parry_enabled",  "ParryEnabled",  "1",   "Enable G-key parry against DrG nextbots"},
+    {"re4m_parry_enabled",  "ParryEnabled",  "1",   "Enable USE-key parry against attacking DrG nextbots"},
     {"re4m_parry_range",    "ParryRange",    "120", "Max distance to parry"},
     {"re4m_parry_cooldown", "ParryCooldown", "0.9", "Cooldown between parries"},
     {"re4m_parry_duration", "ParryDuration", "0.95","How long the riposte animation locks"},
+    {"re4m_counter_enabled", "CounterEnabled", "1", "Enable counter attacks against stunned enemies"},
+    {"re4m_counter_range", "CounterRange", "120", "Max distance to counter a stunned enemy"},
+    {"re4m_counter_damage", "CounterDamage", "750", "Damage dealt by a counter attack"},
+    {"re4m_counter_duration", "CounterDuration", "1.2", "How long the counter animation locks"},
+    {"re4m_door_kick_range", "DoorKickRange", "100", "Max distance to kick open a map door"},
+
+    -- Combat roll / evade
+    {"re4m_roll_enabled", "RollEnabled", "1", "Enable the jump-key combat roll"},
+    {"re4m_roll_cooldown", "RollCooldown", "0.8", "Delay between combat rolls"},
+    {"re4m_roll_iframe", "RollIFrame", "0.2", "Roll invulnerability window in seconds"},
+    {"re4m_roll_forward_distance", "RollForwardDistance", "220", "Forward roll travel distance"},
+    {"re4m_roll_side_distance", "RollSideDistance", "165", "Side roll travel distance"},
+    {"re4m_roll_back_distance", "RollBackDistance", "145", "Backstep travel distance"},
 }
 
-if SERVER then
+-- Replicated ConVars must be created in BOTH realms. When only the server
+-- created them, GetConVar() returned nil on clients, so every client-side
+-- RE4MERCS_GetConfig() call silently fell back to the defaults above and
+-- server settings (HUD toggles, parry/counter ranges, slot count...) never
+-- reached the client.
+do
+    local sharedCVarFlags = SERVER and bit.bor(FCVAR_ARCHIVE, FCVAR_REPLICATED, FCVAR_NOTIFY)
+        or FCVAR_REPLICATED
     for _, data in ipairs(RE4M_CVAR_MAP) do
-        CreateConVar(data[1], data[3], {FCVAR_ARCHIVE, FCVAR_REPLICATED, FCVAR_NOTIFY}, data[4])
+        if not ConVarExists(data[1]) then
+            CreateConVar(data[1], data[3], sharedCVarFlags, data[4])
+        end
     end
 end
+
+-- Much of the code checks RE4MERCS_CONFIG.Debug / DebugSpawns directly, so
+-- keep those fields mirrored from their ConVars.
+local function RE4M_SyncDebugFlags()
+    local debugCVar = GetConVar("re4m_debug")
+    local spawnCVar = GetConVar("re4m_debugspawns")
+    RE4MERCS_CONFIG.Debug = debugCVar and debugCVar:GetBool() or false
+    RE4MERCS_CONFIG.DebugSpawns = spawnCVar and spawnCVar:GetBool() or false
+end
+RE4M_SyncDebugFlags()
+cvars.AddChangeCallback("re4m_debug", RE4M_SyncDebugFlags, "RE4M_SyncDebug")
+cvars.AddChangeCallback("re4m_debugspawns", RE4M_SyncDebugFlags, "RE4M_SyncDebugSpawns")
 
 -- ============================================
 -- PLAYERMODEL PERSISTENCE CONVARS (Client)
@@ -417,6 +486,7 @@ if CLIENT then
     CreateClientConVar("re4m_playercolor_r", "0.3", true, true, "Player color red")
     CreateClientConVar("re4m_playercolor_g", "1.0", true, true, "Player color green")
     CreateClientConVar("re4m_playercolor_b", "0.8", true, true, "Player color blue")
+    CreateClientConVar("re4m_loadout", "", true, false, "Saved loadout weapon classes, comma-separated")
 end
 
 -- ============================================
@@ -487,7 +557,9 @@ function RE4M_GetHandsForModel(modelPath)
         end
     end
 
-    if string.find(lower, "ct_") or string.find(lower, "t_") then
+    -- Counter-Strike player models are named ct_*.mdl / t_*.mdl. The old
+    -- substring test for "t_" matched almost any path ("urban_t_", "art_"...).
+    if string.StartWith(name, "ct_") or string.StartWith(name, "t_") then
         return {
             model = "models/weapons/c_arms_cstrike.mdl",
             skin  = 0,
@@ -632,21 +704,153 @@ function PLAYER:RE4M_GetParryTime()
     return self:GetNW2Float("RE4M_ParryTime", 0)
 end
 
--- Force the exact sequence while the flag is live
-hook.Add("CalcMainActivity", "RE4M_ParryAnimation", function(ply, velocity)
-    if not IsValid(ply) or not ply:RE4M_IsParrying() then return end
+RE4M_COUNTER_ANIMATIONS = {
+    { sequence = "wos_re4m_counter_01", activity = "ACT_RE4M_COUNTER_ATTACK_01", activityID = 2045, frames = 106, fps = 120 },
+    { sequence = "wos_re4m_counter_02", activity = "ACT_RE4M_COUNTER_ATTACK_02", activityID = 2046, frames = 98, fps = 120 },
+    { sequence = "wos_re4m_counter_03", activity = "ACT_RE4M_COUNTER_ATTACK_03", activityID = 2047, frames = 92, fps = 120 },
+}
 
-    local seq = "b_block_forward_riposte"
-    local seqid = ply:LookupSequence(seq)
-    if seqid < 0 then return end
+function RE4M_AmmoDisplayLabel(ammoName)
+    local normalized = string.lower(tostring(ammoName or ""))
+    local labels = {
+        pistol = "9MM ROUNDS",
+        pistol_ammo = "9MM ROUNDS",
+        smg1 = "SMG ROUNDS",
+        smg = "SMG ROUNDS",
+        buckshot = "12 GAUGE SHELLS",
+        shotgun = "12 GAUGE SHELLS",
+        ar2 = "5.56MM ROUNDS",
+        sniperround = "SNIPER ROUNDS",
+        sniperpenetratedround = "SNIPER ROUNDS",
+        revolver = ".357 ROUNDS",
+        ["357"] = ".357 ROUNDS",
+        rpg_round = "RPG ROCKETS",
+        grenade = "GRENADES",
+    }
+    if labels[normalized] then return labels[normalized] end
+    normalized = string.Trim(string.gsub(normalized, "_", " "))
+    return normalized == "" and "AMMO" or string.upper(normalized) .. " ROUNDS"
+end
 
-    return -1, seqid
+local COUNTER_STUN_SEQUENCES = {
+    -- NPCs use flinch1-flinch9 for bullet reactions, including headshot
+    -- staggers. The active flinch sequence itself defines the counter window.
+    "flinch",
+    "flinch3",
+    "flinch_stagger",
+    "flinch_blast",
+    "flinch5",
+    "flinch_block",
+    "flinch_stagger2",
+    "physflinch",
+}
+
+function RE4M_IsCounterStunned(ent)
+    if not IsValid(ent) or not ent.GetSequenceName then return false end
+    local sequenceName = string.lower(ent:GetSequenceName(ent:GetSequence()) or "")
+    for _, baseName in ipairs(COUNTER_STUN_SEQUENCES) do
+        if sequenceName == baseName or
+           string.StartWith(sequenceName, baseName .. "_") or
+           string.match(sequenceName, "^" .. baseName .. "%d+$") then
+            return true
+        end
+    end
+    return false
+end
+
+function PLAYER:RE4M_IsCountering()
+    return self:GetNW2Float("RE4M_CounterTime", 0) >= CurTime()
+end
+
+function PLAYER:RE4M_IsKickingDoor()
+    return self:GetNW2Float("RE4M_DoorKickTime", 0) >= CurTime()
+end
+
+local function RE4M_GetActionSequence(ply)
+    if not IsValid(ply) then return end
+    if ply:GetNW2Float("RE4M_RollEndTime", 0) > CurTime() then
+        return ply:GetNW2String("RE4M_RollSequence", "")
+    end
+    if ply:RE4M_IsCountering() then return ply:GetNW2String("RE4M_CounterSequence", "") end
+    if ply:RE4M_IsKickingDoor() then return "wos_re4m_counter_02" end
+    if ply:RE4M_IsParrying() then return "b_block_forward_riposte" end
+end
+
+-- Clear callbacks left behind by the earlier global gamemode override, and
+-- old per-action hook IDs when Lua auto-refreshes this file.
+GM.CalcMainActivity = nil
+GM.UpdateAnimation = nil
+hook.Remove("CalcMainActivity", "RE4M_CounterAnimation")
+hook.Remove("CalcMainActivity", "RE4M_DoorKickAnimation")
+hook.Remove("CalcMainActivity", "RE4M_ParryAnimation")
+hook.Remove("UpdateAnimation", "RE4M_CounterPlayback")
+hook.Remove("UpdateAnimation", "RE4M_DoorKickPlayback")
+hook.Remove("UpdateAnimation", "RE4M_ParryPlayback")
+
+-- One action hook avoids conflicting sequence returns; idle animation is
+-- left to the base gamemode and other animation addons.
+hook.Add("CalcMainActivity", "RE4M_ActionAnimation", function(ply)
+    local sequenceName = RE4M_GetActionSequence(ply)
+    if not sequenceName or sequenceName == "" then return end
+    local sequenceID = ply:LookupSequence(sequenceName)
+    if not sequenceID or sequenceID < 0 then return end
+    return -1, sequenceID
 end)
 
-hook.Add("UpdateAnimation", "RE4M_ParryPlayback", function(ply, velocity, maxSeqGroundSpeed)
-    if ply:RE4M_IsParrying() then
-        ply:SetPlaybackRate(1.0) -- adjust if it feels too fast/slow
+hook.Add("UpdateAnimation", "RE4M_ActionAnimationPlayback", function(ply)
+    if not IsValid(ply) then return end
+    if ply:GetNW2Float("RE4M_RollEndTime", 0) > CurTime() then
+        ply:SetPlaybackRate(1)
         return true
+    end
+    if ply:RE4M_IsCountering() or ply:RE4M_IsKickingDoor() then
+        local sequenceDuration = ply:SequenceDuration(ply:GetSequence())
+        local requestedDuration = ply:GetNW2Float("RE4M_CounterAnimDuration", 0)
+        local rate = sequenceDuration > 0 and requestedDuration > 0 and
+            math.Clamp(sequenceDuration / requestedDuration, 0.05, 8) or 1
+        ply:SetPlaybackRate(rate)
+        return true
+    end
+    if ply:RE4M_IsParrying() then
+        ply:SetPlaybackRate(1)
+        return true
+    end
+end)
+
+-- ============================================
+-- COMBAT ROLL MOVEMENT (shared so it is predicted)
+-- ============================================
+-- This used to run only on the server, so the client predicted a standing
+-- player while the server moved them, which rubber-banded every roll.
+
+hook.Add("SetupMove", "RE4M_CombatRollLockMovement", function(ply, mv)
+    if ply:GetNW2Float("RE4M_RollEndTime", 0) <= CurTime() then return end
+    mv:SetForwardSpeed(0)
+    mv:SetSideSpeed(0)
+    mv:SetUpSpeed(0)
+    mv:SetMaxClientSpeed(0)
+end)
+
+hook.Add("Move", "RE4M_CombatRollMovement", function(ply, mv)
+    local startTime = ply:GetNW2Float("RE4M_RollStartTime", 0)
+    local endTime = ply:GetNW2Float("RE4M_RollEndTime", 0)
+    if endTime <= CurTime() or endTime <= startTime then return end
+    local direction = ply:GetNW2Vector("RE4M_RollDirection", vector_origin)
+    if direction:LengthSqr() < 0.5 then return end
+    direction = Vector(direction.x, direction.y, 0)
+    direction:Normalize()
+    local duration = endTime - startTime
+    local distance = ply:GetNW2Float("RE4M_RollDistance", 220)
+    local velocity = mv:GetVelocity()
+    mv:SetVelocity(Vector(direction.x * distance / duration, direction.y * distance / duration, velocity.z))
+end)
+
+-- Players pass through each other (see GM:ShouldCollide). ShouldCollide is
+-- only consulted for entities flagged with SetCustomCollisionCheck.
+hook.Add(SERVER and "PlayerSpawn" or "NetworkEntityCreated", "RE4M_PlayerCustomCollision", function(ent)
+    if IsValid(ent) and ent:IsPlayer() then
+        ent:SetCustomCollisionCheck(true)
+        ent:CollisionRulesChanged()
     end
 end)
 
@@ -888,6 +1092,15 @@ function GM:ShouldCollide(ent1, ent2)
 end
 
 function GM:PlayerShouldTakeDamage(ply, attacker)
+    if RE4M_STATE and RE4M_STATE.GameState == GAMESTATE_ACTIVE then
+        local now = CurTime()
+        if ply:GetNW2Float("RE4M_ParryTime", 0) > now or
+           ply:GetNW2Float("RE4M_CounterTime", 0) > now or
+           ply:GetNW2Float("RE4M_DoorKickTime", 0) > now then
+            return false
+        end
+    end
+
     local cfg = RE4MERCS_GetConfig()
     if not cfg.FriendlyFire and IsValid(attacker) and attacker:IsPlayer() and attacker ~= ply then
         return false

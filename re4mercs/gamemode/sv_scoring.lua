@@ -56,8 +56,10 @@ function RE4M_OnKill(ply, victim, dmgInfo)
     local multiplier = RE4MERCS_GetComboMultiplier(combo)
     local bonus = 0
 
-    -- Headshot bonus
-    local hitGroup = ply.RE4M_LastHitGroup or HITGROUP_GENERIC
+    -- Headshot bonus. Uses the hit group of the killing blow on THIS victim;
+    -- it used to read the attacker's last hit on any NPC, so headshotting one
+    -- enemy and then blowing up another still paid a headshot bonus.
+    local hitGroup = IsValid(victim) and victim.RE4M_LastHitGroup or HITGROUP_GENERIC
     if hitGroup == HITGROUP_HEAD then
         bonus = bonus + (cfg.HeadshotBonus or 250)
     end
@@ -67,8 +69,10 @@ function RE4M_OnKill(ply, victim, dmgInfo)
         bonus = bonus + (cfg.EliteKillBonus or 750)
     end
 
-    -- Melee kill bonus
-    if dmgInfo and (dmgInfo:IsDamageType(DMG_CLUB) or dmgInfo:IsDamageType(DMG_SLASH)) then
+    -- Melee kill bonus. OnNPCKilled provides no DamageInfo, so NPC melee kills
+    -- never got this bonus; fall back to the damage type recorded on the victim.
+    local damageType = dmgInfo and dmgInfo:GetDamageType() or (IsValid(victim) and victim.RE4M_LastDamageType) or 0
+    if bit.band(damageType, bit.bor(DMG_CLUB, DMG_SLASH)) ~= 0 then
         bonus = bonus + (cfg.MeleeKillBonus or 300)
     end
 
@@ -109,11 +113,11 @@ function RE4M_OnKill(ply, victim, dmgInfo)
             net.WriteFloat(bonusTime)
         net.Send(ply)
 
-        -- Play sound with increasing pitch
-        ply:EmitSound("re4mercs/combo_milestone.ogg", 60, 100 + math.min(combo, 50), 0.7)
-        if not file.Exists("sound/re4mercs/combo_milestone.ogg", "GAME") then
-            ply:EmitSound("buttons/button15.wav", 60, 100 + math.min(combo, 50), 0.7)
-        end
+        -- Play sound with increasing pitch. The old code emitted a sound path
+        -- that is not shipped, then ALSO played the fallback.
+        local milestoneSound = file.Exists("sound/ui/combo_milestone.ogg", "GAME")
+            and "ui/combo_milestone.ogg" or "buttons/button15.wav"
+        ply:EmitSound(milestoneSound, 60, 100 + math.min(combo, 50), 0.7)
     end
 
     -- Send kill feed notification
@@ -130,6 +134,22 @@ function RE4M_OnKill(ply, victim, dmgInfo)
         net.WriteUInt(combo, 16)
         net.WriteFloat(multiplier)
     net.Send(ply)
+
+    -- Floating kill score for everyone. This was only sent from the
+    -- OnNPCKilled hook, so NextBot kills credited through their OnKilled
+    -- override showed no score float unless the bot also ran that hook.
+    local deathPos = Vector(0, 0, 0)
+    if IsValid(victim) then
+        local ok, pos = pcall(victim.GetPos, victim)
+        if ok and pos then deathPos = pos end
+    end
+    net.Start("RE4M_EnemyKilled")
+        net.WriteVector(deathPos)
+        net.WriteUInt(math.min(totalScore, 16777215), 24)
+        net.WriteFloat(ply.RE4M_LastTimeAdded or 0)
+        net.WriteBool(IsValid(victim) and victim.RE4M_IsElite or false)
+        net.WriteEntity(ply)
+    net.Broadcast()
 
     -- Try to spawn a pickup
     RE4M_TrySpawnPickup(victim)
@@ -156,16 +176,41 @@ function RE4M_ResetCombo(ply, reason)
     end
 end
 
---- Reset combo when player takes damage
-hook.Add("EntityTakeDamage", "RE4M_PlayerDamageComboReset", function(target, dmgInfo)
-    if RE4M_STATE.GameState ~= GAMESTATE_ACTIVE then return end
+--- Reset combo when player takes damage.
+--- PostEntityTakeDamage only runs after every EntityTakeDamage hook and
+--- PlayerShouldTakeDamage, and reports whether damage was actually applied.
+--- On EntityTakeDamage, the combo was also reset by hits that roll/parry
+--- i-frames or friendly-fire protection blocked.
+--- Tell a player they were hit, and from where, for the gethit screen
+--- effect (cl_hud.lua). Only damage that was actually applied counts, so
+--- hits blocked by roll/parry i-frames or friendly-fire rules show nothing.
+hook.Add("PostEntityTakeDamage", "RE4M_PlayerHitFeedback", function(target, dmgInfo, took)
+    if not took or not IsValid(target) or not target:IsPlayer() or dmgInfo:GetDamage() <= 0 then return end
+
+    local source
+    local attacker = dmgInfo:GetAttacker()
+    if IsValid(attacker) and attacker ~= target then
+        source = attacker:WorldSpaceCenter()
+    else
+        local hitPos = dmgInfo:GetDamagePosition()
+        if isvector(hitPos) and hitPos ~= vector_origin then source = hitPos end
+    end
+
+    net.Start("RE4M_PlayerHit")
+        net.WriteBool(source ~= nil)
+        if source then net.WriteVector(source) end
+    net.Send(target)
+end)
+
+hook.Remove("EntityTakeDamage", "RE4M_PlayerDamageComboReset")
+hook.Add("PostEntityTakeDamage", "RE4M_PlayerDamageComboReset", function(target, dmgInfo, took)
+    if not took or RE4M_STATE.GameState ~= GAMESTATE_ACTIVE then return end
+    if not IsValid(target) or not target:IsPlayer() then return end
+    if dmgInfo:GetDamage() <= 0 then return end
 
     local cfg = RE4MERCS_GetConfig()
     if not cfg.ComboResetOnDamage then return end
 
-    if IsValid(target) and target:IsPlayer() then
-        local attacker = dmgInfo:GetAttacker()
-        if attacker == target then return end
-        RE4M_ResetCombo(target, "damage taken")
-    end
+    if dmgInfo:GetAttacker() == target then return end
+    RE4M_ResetCombo(target, "damage taken")
 end)

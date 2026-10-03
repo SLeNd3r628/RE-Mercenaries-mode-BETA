@@ -1,22 +1,41 @@
 -- RE4 Mercenaries Remake - Round Management (Server)
 
+-- Retained between same-map round resets so consecutive matches do not
+-- restart with the same BGM track.
+local previousRoundMusicPath
+
 local function RE4M_AdminCleanupThen(callback)
-    local command = concommand.GetTable().gmod_admin_cleanup
-    if not command then
-        ErrorNoHalt("[RE4 Mercs] gmod_admin_cleanup is unavailable; cannot safely reset the round.\n")
-        return
+    local hookID = "RE4M_AdminCleanupBeforeMenuRespawn"
+    local timeoutID = "RE4M_AdminCleanupTimeout"
+    local done = false
+
+    local function finish()
+        if done then return end
+        done = true
+        hook.Remove("PostCleanupMap", hookID)
+        timer.Remove(timeoutID)
+        if callback then callback() end
     end
 
-    local hookID = "RE4M_AdminCleanupBeforeMenuRespawn"
     hook.Remove("PostCleanupMap", hookID)
-    hook.Add("PostCleanupMap", hookID, function()
-        hook.Remove("PostCleanupMap", hookID)
-        if callback then callback() end
-    end)
+    hook.Add("PostCleanupMap", hookID, finish)
 
-    -- This is Garry's Mod's real Admin Cleanup console command. It performs
-    -- cleanup list removal and game.CleanUpMap with the engine's normal hooks.
-    game.ConsoleCommand("gmod_admin_cleanup\n")
+    -- gmod_admin_cleanup comes from Sandbox's cleanup module. This gamemode
+    -- derives from "base", where that command may not exist. Previously the
+    -- function just bailed out in that case, so players were never respawned
+    -- and the lobby never reopened. Fall back to game.CleanUpMap directly.
+    if concommand.GetTable().gmod_admin_cleanup then
+        game.ConsoleCommand("gmod_admin_cleanup\n")
+        -- Safety net in case the command is blocked and never cleans up.
+        timer.Create(timeoutID, 2, 1, function()
+            if done then return end
+            game.CleanUpMap()
+            finish()
+        end)
+    else
+        game.CleanUpMap()
+        finish()
+    end
 end
 
 local function RE4M_RespawnForMenu(ply)
@@ -35,6 +54,7 @@ end
 
 --- Start the pre-round countdown
 function RE4M_StartPreRound()
+    timer.Remove("RE4M_LastPlayerDeathEnd")
     timer.Remove("RE4M_PreRound")
     timer.Remove("RE4M_RoundTick")
     timer.Remove("RE4M_ComboDecay")
@@ -70,6 +90,7 @@ function RE4M_StartPreRound()
         end
 
         ply:Freeze(true)
+        ply:SetMaxHealth(cfg.PlayerHealth or 150)
         ply:SetHealth(cfg.PlayerHealth or 150)
         ply:SetArmor(cfg.PlayerArmor or 50)
     end
@@ -78,10 +99,25 @@ function RE4M_StartPreRound()
     RE4M_CleanupNPCs()
     RE4M_CleanupPickups()
 
-    -- Select random music track
+    -- Select a random track, excluding the track used in the previous match
+    -- whenever at least one alternative exists.
     local tracks = cfg.RoundMusic or {}
     if #tracks > 0 then
-        RE4M_STATE.MusicTrack = math.random(1, #tracks)
+        local candidates = {}
+        for index, path in ipairs(tracks) do
+            if #tracks == 1 or path ~= previousRoundMusicPath then
+                candidates[#candidates + 1] = {index = index, path = path}
+            end
+        end
+        if #candidates == 0 then
+            for index, path in ipairs(tracks) do
+                candidates[#candidates + 1] = {index = index, path = path}
+            end
+        end
+
+        local choice = candidates[math.random(1, #candidates)]
+        RE4M_STATE.MusicTrack = choice.index
+        previousRoundMusicPath = choice.path
     end
 
     -- Pre-round countdown
@@ -173,19 +209,25 @@ end
 
 --- Extend the round timer
 function RE4M_ExtendTime(seconds, ply)
+    if RE4M_STATE.GameState ~= GAMESTATE_ACTIVE then return end
+    seconds = tonumber(seconds) or 0
+    if seconds ~= seconds or seconds <= 0 then return end -- reject NaN / non-positive
+
     local cfg = RE4MERCS_GetConfig()
     local maxTime = cfg.MaxRoundTime or 600
 
     local currentRemaining = RE4M_STATE.RoundEndTime - CurTime()
     local newRemaining = math.min(currentRemaining + seconds, maxTime)
+    local added = newRemaining - currentRemaining
 
     RE4M_STATE.RoundEndTime = CurTime() + newRemaining
     SetGlobalFloat("RE4M_RoundEndTime", RE4M_STATE.RoundEndTime)
 
-    -- Notify the player who earned the extension
-    if IsValid(ply) then
+    -- Notify the player who earned the extension. Report what was actually
+    -- added, which is less than requested when the MaxRoundTime cap is hit.
+    if IsValid(ply) and added > 0.05 then
         net.Start("RE4M_TimeExtend")
-            net.WriteFloat(seconds)
+            net.WriteFloat(math.Round(added, 1))
         net.Send(ply)
 
         ply:EmitSound("ui/time_extend.ogg", 60, 100, 0.6)

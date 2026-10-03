@@ -3,6 +3,16 @@
 local menuSoundStation = nil
 local roundSoundStation = nil
 local resultsSoundStation = nil
+local musicGeneration = {menu = 0, round = 0, results = 0}
+
+local function BeginMusicRequest(kind)
+    musicGeneration[kind] = musicGeneration[kind] + 1
+    return musicGeneration[kind]
+end
+
+local function StopLateStation(station)
+    if IsValid(station) then station:Stop() end
+end
 
 -- ============================================
 -- MENU MUSIC
@@ -10,6 +20,7 @@ local resultsSoundStation = nil
 
 function RE4M_PlayMenuMusic()
     RE4M_StopMenuMusic()
+    local requestGeneration = musicGeneration.menu
 
     local cfg = RE4MERCS_GetConfig()
     local musicPath = cfg.MenuMusic or "ui/menu.ogg"
@@ -30,6 +41,10 @@ function RE4M_PlayMenuMusic()
     end
 
     sound.PlayFile("sound/" .. musicPath, "noplay", function(station, errCode, errStr)
+        if requestGeneration ~= musicGeneration.menu then
+            StopLateStation(station)
+            return
+        end
         if IsValid(station) then
             menuSoundStation = station
             station:SetVolume(volume)
@@ -42,6 +57,7 @@ function RE4M_PlayMenuMusic()
 end
 
 function RE4M_StopMenuMusic()
+    BeginMusicRequest("menu")
     if IsValid(menuSoundStation) then
         menuSoundStation:Stop()
         menuSoundStation = nil
@@ -54,6 +70,7 @@ end
 
 function RE4M_PlayRoundMusic(trackIndex)
     RE4M_StopRoundMusic()
+    local requestGeneration = musicGeneration.round
 
     local cfg = RE4MERCS_GetConfig()
     local tracks = cfg.RoundMusic or {}
@@ -83,6 +100,10 @@ function RE4M_PlayRoundMusic(trackIndex)
     end
 
     sound.PlayFile("sound/" .. musicPath, "noplay", function(station, errCode, errStr)
+        if requestGeneration ~= musicGeneration.round then
+            StopLateStation(station)
+            return
+        end
         if IsValid(station) then
             roundSoundStation = station
             station:SetVolume(volume)
@@ -97,6 +118,7 @@ function RE4M_PlayRoundMusic(trackIndex)
 end
 
 function RE4M_StopRoundMusic()
+    BeginMusicRequest("round")
     if IsValid(roundSoundStation) then
         roundSoundStation:Stop()
         roundSoundStation = nil
@@ -110,6 +132,7 @@ end
 
 function RE4M_PlayResultsMusic()
     RE4M_StopResultsMusic()
+    local requestGeneration = musicGeneration.results
 
     local cfg = RE4MERCS_GetConfig()
     local musicPath = cfg.ResultsMusic or "ui/results.ogg"
@@ -120,6 +143,10 @@ function RE4M_PlayResultsMusic()
     end
 
     sound.PlayFile("sound/" .. musicPath, "noplay", function(station, errCode, errStr)
+        if requestGeneration ~= musicGeneration.results then
+            StopLateStation(station)
+            return
+        end
         if IsValid(station) then
             resultsSoundStation = station
             station:SetVolume(volume)
@@ -132,6 +159,7 @@ function RE4M_PlayResultsMusic()
 end
 
 function RE4M_StopResultsMusic()
+    BeginMusicRequest("results")
     if IsValid(resultsSoundStation) then
         resultsSoundStation:Stop()
         resultsSoundStation = nil

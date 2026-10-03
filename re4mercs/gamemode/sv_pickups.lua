@@ -155,13 +155,25 @@ function RE4M_SpawnPickupDelayed(pos, pickupType, delay)
 
         -- Apply a small upward force so it pops up
         local phys = ent:GetPhysicsObject()
-        if IsValid(phys) then
+        if IsValid(phys) and ent:GetClass() == "re_ammopickup" then
             phys:ApplyForceCenter(Vector(0, 0, 150))
         end
 
         -- Track in pickup list
         if RE4M_STATE then
             table.insert(RE4M_STATE.Pickups, ent)
+        end
+        ent.RE4M_Pickup = true
+        ent.RE4M_TouchReadyAt = CurTime() + 0.75 -- let it land before touch pickup
+
+        -- re4m_pickuplifetime was never applied; the entities only removed
+        -- themselves after their own hard-coded 25 seconds.
+        local cfg = RE4MERCS_GetConfig and RE4MERCS_GetConfig()
+        local lifetime = cfg and tonumber(cfg.PickupLifetime) or 20
+        if lifetime > 0 then
+            timer.Simple(lifetime, function()
+                if IsValid(ent) and not ent.Used then ent:Remove() end
+            end)
         end
 
         if RE4MERCS_CONFIG and RE4MERCS_CONFIG.Debug then
@@ -196,7 +208,7 @@ function RE4M_TrySpawnPickup(victim)
         dropChance = math.min(dropChance * 2.5, 0.8)  -- Up to 80% for elites
     end
     local dropOwner = victim.RE4M_LastDamageAttacker
-    if IsValid(dropOwner) and RE4M_PlayerHasSkill and RE4M_PlayerHasSkill(dropOwner, "item_drop") then
+    if IsValid(dropOwner) and dropOwner:IsPlayer() and RE4M_PlayerHasSkill and RE4M_PlayerHasSkill(dropOwner, "item_drop") then
         dropChance = math.min(dropChance * 1.5, 0.95)
     end
 
@@ -207,18 +219,20 @@ function RE4M_TrySpawnPickup(victim)
     local ok, deathPos = pcall(victim.GetPos, victim)
     if not ok or not deathPos then return end
 
-    -- Find the attacker to determine drop type
-    -- We look for the player who last damaged this NPC
-    local attacker = nil
+    -- Prefer the player who last damaged this NPC so skill-based drop
+    -- bonuses and the drop type belong to the correct player.
+    local attacker = victim.RE4M_LastDamageAttacker
+    if not IsValid(attacker) or not attacker:IsPlayer() then attacker = nil end
 
-    -- Check all players and find the one closest / who killed it
-    -- The scoring system tracks this, but as a fallback just find nearest
-    for _, ply in ipairs(player.GetAll()) do
-        if IsValid(ply) and ply:Alive() then
-            if not attacker then
-                attacker = ply
-            elseif ply:GetPos():DistToSqr(deathPos) < attacker:GetPos():DistToSqr(deathPos) then
-                attacker = ply
+    -- If no player damage source was recorded, use the nearest living player.
+    if not attacker then
+        for _, ply in ipairs(player.GetAll()) do
+            if IsValid(ply) and ply:IsPlayer() and ply:Alive() then
+                if not attacker then
+                    attacker = ply
+                elseif ply:GetPos():DistToSqr(deathPos) < attacker:GetPos():DistToSqr(deathPos) then
+                    attacker = ply
+                end
             end
         end
     end
@@ -244,15 +258,19 @@ local function RE4M_ClassToPickupType(className)
     return nil
 end
 
-hook.Add("PlayerTouch", "RE4M_PickupTouch", function(ply, ent)
-    if not IsValid(ply) or not IsValid(ent) then return end
-    if not ply:Alive() then return end
-    if RE4M_STATE.GameState ~= GAMESTATE_ACTIVE then return end
+function RE4M_CollectPickup(ply, ent)
+    if not IsValid(ply) or not ply:IsPlayer() or not ply:Alive() or not IsValid(ent) then return false end
+    if RE4M_STATE.GameState ~= GAMESTATE_ACTIVE or ent.Used then return false end
 
     local pickupType = RE4M_ClassToPickupType(ent:GetClass())
-    if not pickupType then return end -- not one of ours
+    if not pickupType then return false end -- not one of ours
+
+    -- Shared by touch and the custom third-person USE request. Mark it before
+    -- awarding anything so simultaneous touch/use inputs cannot double-collect.
+    ent.Used = true
 
     local cfg = RE4MERCS_GetConfig and RE4MERCS_GetConfig() or {}
+    local ammoDisplayLabel
 
     if pickupType == "health" then
         local amount = cfg.HealthPickupAmount or 25
@@ -275,11 +293,55 @@ hook.Add("PlayerTouch", "RE4M_PickupTouch", function(ply, ent)
             end
         end
 
+    elseif pickupType == "ammo" and math.random(1, 1000) <= 25 then
+        -- Rare explosive roll (2.5%), matching the ammo entity's own Use().
+        -- The client already had notifications for these, but routing pickups
+        -- through this collector had made them impossible to get.
+        if math.random(1, 25) <= 5 then
+            pickupType = "rare_rpg"
+            ply:GiveAmmo(1, "RPG_Round")
+        else
+            pickupType = "rare_grenade"
+            ply:GiveAmmo(1, "Grenade")
+            ply:GiveAmmo(1, "SMG1_Grenade")
+        end
+
     elseif pickupType == "ammo" then
         local wep = ply:GetActiveWeapon()
+        local category = ent:GetNW2String("RE4M_AmmoCategory", "")
+        if category ~= "" then
+            local matchTokens = {
+                pistol = {"pistol", "9mm", "sidearm"},
+                smg = {"smg", "ar2", "rifle", "assault"},
+                shotgun = {"buckshot", "shotgun", "shell"},
+                sniper = {"sniper", "rifle", "338", "762"},
+                magnum = {"357", "magnum", "revolver"},
+                mine = {"mine", "slam", "grenade"},
+            }
+            local tokens = matchTokens[category]
+            if tokens then
+                for _, candidate in ipairs(ply:GetWeapons()) do
+                    if not IsValid(candidate) then continue end
+                    local candidateAmmo = candidate:GetPrimaryAmmoType()
+                    local candidateName = candidateAmmo and candidateAmmo >= 0 and game.GetAmmoName(candidateAmmo) or ""
+                    local lowerName = string.lower(tostring(candidateName or ""))
+                    local matched = false
+                    for _, token in ipairs(tokens) do
+                        if string.find(lowerName, token, 1, true) then
+                            wep = candidate
+                            matched = true
+                            break
+                        end
+                    end
+                    if matched then break end
+                end
+            end
+        end
         if IsValid(wep) then
             local ammoType = wep:GetPrimaryAmmoType()
             if ammoType and ammoType >= 0 then
+                local ammoName = game.GetAmmoName(ammoType)
+                ammoDisplayLabel = RE4M_AmmoDisplayLabel and RE4M_AmmoDisplayLabel(ammoName) or ammoName
                 local maxAmmo = game.GetAmmoMax(ammoType) or 100
                 local giveAmt = math.max(1, math.floor(maxAmmo * (cfg.AmmoPickupMultiplier or 0.25)))
                 if RE4M_GiveAmmo then
@@ -299,10 +361,19 @@ hook.Add("PlayerTouch", "RE4M_PickupTouch", function(ply, ent)
     -- Tell the client what was picked up (drives the on-screen notification)
     net.Start("RE4M_PickupCollected")
         net.WriteString(pickupType)
+        if pickupType == "ammo" then net.WriteString(ammoDisplayLabel or "AMMO") end
     net.Send(ply)
 
-    if file.Exists("sound/ui/pickup_" .. pickupType .. ".ogg", "GAME") then
-        ply:EmitSound("ui/pickup_" .. pickupType .. ".ogg", 60, 100, 0.6)
+    local soundType = string.StartWith(pickupType, "rare_") and "ammo" or pickupType
+    local fallbackSounds = {
+        health = "items/smallmedkit1.wav",
+        ammo   = "items/ammo_pickup.wav",
+        time   = "buttons/button9.wav",
+    }
+    if file.Exists("sound/ui/pickup_" .. soundType .. ".ogg", "GAME") then
+        ply:EmitSound("ui/pickup_" .. soundType .. ".ogg", 60, 100, 0.6)
+    elseif fallbackSounds[soundType] then
+        ply:EmitSound(fallbackSounds[soundType], 60, 100, 0.6)
     end
 
     -- Untrack and remove the world entity
@@ -316,16 +387,45 @@ hook.Add("PlayerTouch", "RE4M_PickupTouch", function(ply, ent)
     if IsValid(ent) then
         pcall(ent.Remove, ent)
     end
+    return true
+end
+
+-- Walk-over pickup. There is no "PlayerTouch" gamemode hook, so the old hook
+-- never ran and touching a drop did nothing. Poll the few tracked drops
+-- instead. Herbs are left for the USE key while at full health so they are
+-- not wasted by walking over them.
+local TOUCH_RADIUS_SQR = 60 * 60
+timer.Create("RE4M_PickupTouch", 0.1, 0, function()
+    if not RE4M_STATE or RE4M_STATE.GameState ~= GAMESTATE_ACTIVE then return end
+    local pickups = RE4M_STATE.Pickups
+    if not pickups or #pickups == 0 then return end
+
+    local now = CurTime()
+    local players = player.GetAll()
+    for i = #pickups, 1, -1 do
+        local ent = pickups[i]
+        if not IsValid(ent) then
+            table.remove(pickups, i)
+        elseif not ent.Used and (ent.RE4M_TouchReadyAt or 0) <= now then
+            local entPos = ent:GetPos()
+            for _, ply in ipairs(players) do
+                if IsValid(ply) and ply:Alive() and ply:GetPos():DistToSqr(entPos) <= TOUCH_RADIUS_SQR then
+                    local isHerb = ent:GetClass() == DROP_SETTINGS.DropEntities.health
+                    if not isHerb or ply:Health() < ply:GetMaxHealth() then
+                        if RE4M_CollectPickup(ply, ent) then break end
+                    end
+                end
+            end
+        end
+    end
 end)
 
--- NOTE: "rare_rpg" / "rare_grenade" pickup types are referenced client-side
--- (cl_init.lua RE4M_PickupCollected receiver) but there are no matching
--- entity classes or drop weights defined anywhere server-side. If you want
--- these, add them to DROP_SETTINGS.DropEntities above and give them a
--- weight in the health/low/normal/full weight tables, e.g.:
---   DropEntities.rare_rpg = "re_rpgammo_pickup"
---   CriticalHealthWeights.rare_rpg = 2  (and to the other weight tables)
--- Until then they will simply never be rolled by WeightedRandom().
+-- The pickup entities' own ENT:Use() heals a random 25-50, ignores
+-- re4m_healthpickupamount and every pickup skill (Pharmacist, Medic, Time
+-- Bonus...). Route default USE on them through the gamemode collector.
+function RE4M_IsModePickup(ent)
+    return IsValid(ent) and RE4M_ClassToPickupType(ent:GetClass()) ~= nil
+end
 
 -- ============================================
 -- CLEANUP
